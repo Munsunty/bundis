@@ -1,8 +1,14 @@
 {
-  "name": "bundis",
-  "module": "index.ts",
+  "name": "bun-resp-sqlite",
+  "module": "src/index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "test": "bun test",
+    "typecheck": "bun x tsc --noEmit"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
