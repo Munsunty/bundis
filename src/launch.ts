@@ -1,5 +1,5 @@
 /**
- * Public launchers for using bun-resp-sqlite from another project.
+ * Public launchers for using bundis from another project.
  *
  * Two ways to run the server (both return a ready-to-use `redis://` URL for a
  * stock `Bun.RedisClient`):
@@ -15,7 +15,7 @@ import { startServer, type RunningServer } from "./server";
 import type { ServerConfig } from "./config";
 
 /** stdout JSON `event` value the CLI prints once it is accepting connections. */
-export const READY_EVENT = "bun-resp-sqlite:ready";
+export const READY_EVENT = "bundis:ready";
 
 export interface LaunchOptions {
   /** Bind address (default "127.0.0.1"; use "0.0.0.0" to expose externally). */
@@ -146,7 +146,7 @@ async function waitForReady(
     ]);
     if (done) {
       reader.releaseLock();
-      throw new Error("bun-resp-sqlite child exited before signalling ready");
+      throw new Error("bundis child exited before signalling ready");
     }
     buf += decoder.decode(value, { stream: true });
     let nl: number;
@@ -180,7 +180,7 @@ async function drain(reader: { read(): Promise<{ done: boolean }> }): Promise<vo
 function rejectAfter(ms: number): Promise<never> {
   return new Promise((_, reject) => {
     const t = setTimeout(
-      () => reject(new Error("timed out waiting for bun-resp-sqlite ready signal")),
+      () => reject(new Error("timed out waiting for bundis ready signal")),
       Math.max(0, ms),
     );
     (t as unknown as { unref?: () => void }).unref?.();

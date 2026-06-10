@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { existsSync, rmSync } from "node:fs";
 
 export function mkTempDbPath(): string {
-  const name = `bun-resp-sqlite-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const name = `bundis-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   return join(tmpdir(), name);
 }
 

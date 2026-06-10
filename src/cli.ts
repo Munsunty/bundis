@@ -3,7 +3,7 @@
  * CLI entry: load config from flags/env, start the server, signal readiness.
  *
  * Run: `bun run src/cli.ts [--host H] [--port P] [--db PATH] [--password PW]`
- * (or `bunx bun-resp-sqlite ...` when installed as a dependency).
+ * (or `bunx bundis ...` when installed as a dependency).
  *
  * stdout carries exactly one machine-readable JSON ready line — this is the
  * signal `spawnServer()` waits for. Human-facing logs go to stderr.
@@ -25,7 +25,7 @@ console.log(
   }),
 );
 console.error(
-  `bun-resp-sqlite listening on ${running.hostname}:${running.port} ` +
+  `bundis listening on ${running.hostname}:${running.port} ` +
     `(db: ${config.dbPath}${config.password ? ", auth: on" : ""})`,
 );
 

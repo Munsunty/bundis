@@ -1,14 +1,15 @@
 {
-  "name": "bun-resp-sqlite",
+  "name": "bundis",
   "version": "0.1.0",
   "description": "RESP3-compatible server backed by SQLite — works with the stock Bun.RedisClient",
+  "license": "MIT",
   "type": "module",
   "module": "src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "bin": {
-    "bun-resp-sqlite": "src/cli.ts"
+    "bundis": "src/cli.ts"
   },
   "files": [
     "src",
@@ -19,6 +20,15 @@
     "type": "git",
     "url": "git+https://github.com/Munsunty/bundis.git"
   },
+  "keywords": [
+    "redis",
+    "resp",
+    "resp3",
+    "sqlite",
+    "bun",
+    "redis-server",
+    "embedded"
+  ],
   "engines": {
     "bun": ">=1.1.0"
   },

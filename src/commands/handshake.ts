@@ -80,7 +80,7 @@ export function info(ctx: CommandContext): Reply {
     "# Server",
     "redis_version:7.4.0",
     "redis_mode:standalone",
-    "run_id:bun-resp-sqlite",
+    "run_id:bundis",
     "tcp_port:" + ctx.server.config.port,
     "",
     "# Clients",
@@ -117,7 +117,7 @@ export function client(ctx: CommandContext): Reply {
 
 function helloMap(ctx: CommandContext): Reply {
   return R.map([
-    [R.bulk("server"), R.bulk("bun-resp-sqlite")],
+    [R.bulk("server"), R.bulk("bundis")],
     [R.bulk("version"), R.bulk("0.1.0")],
     [R.bulk("proto"), R.int(ctx.conn.proto)],
     [R.bulk("id"), R.int(ctx.conn.id)],

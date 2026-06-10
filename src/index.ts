@@ -1,11 +1,11 @@
 /**
- * Public API of bun-resp-sqlite.
+ * Public API of bundis.
  *
  * - embedServer(): run the server in the current process (main-process mode).
  * - spawnServer(): run the server as a separate Bun process (sidecar mode).
  * - startServer(): lower-level handle taking a full ServerConfig.
  *
- * For a standalone daemon, use the CLI: `bun run src/cli.ts` / `bunx bun-resp-sqlite`.
+ * For a standalone daemon, use the CLI: `bun run src/cli.ts` / `bunx bundis`.
  */
 
 export { startServer, type RunningServer } from "./server";
