@@ -11,16 +11,70 @@ See [`CLAUDE.md`](./CLAUDE.md) for the full design SSOT.
 Bun.RedisClient ──RESP3 over TCP──▶ bun-resp-sqlite ──▶ SQLite (.db file)
 ```
 
-## Run
+## Install (use from another project)
 
 ```bash
-bun run src/index.ts --port 6379 --db ./data.db
+bun add github:Munsunty/bundis        # from GitHub
+bun add bun-resp-sqlite@file:../bundis  # or from a local checkout
+```
+
+Ships as TypeScript source — it requires the Bun runtime (which is a given:
+the server itself depends on `bun:sqlite` and `Bun.listen`).
+
+### Main-process mode — `embedServer()`
+
+Runs the server inside your process. No IPC, instant startup; shares the event
+loop with your app (`bun:sqlite` is synchronous).
+
+```ts
+import { RedisClient } from "bun";
+import { embedServer } from "bun-resp-sqlite";
+
+const server = embedServer({ port: 6379, dbPath: "./data.db" });
+const client = new RedisClient(server.url); // stock client, unmodified
+
+await client.set("k", "v");
+await client.get("k"); // "v"
+
+client.close();
+server.stop();
+```
+
+### Separate-process mode — `spawnServer()`
+
+Spawns the server as its own Bun process and resolves once it is accepting
+connections. Isolates the SQLite writer and any blocking work from your app.
+
+```ts
+import { RedisClient } from "bun";
+import { spawnServer } from "bun-resp-sqlite";
+
+const server = await spawnServer({ port: 0, dbPath: "./data.db" }); // 0 = ephemeral port
+const client = new RedisClient(server.url);
+
+await client.set("k", "v");
+
+client.close();
+await server.stop(); // kills the child and waits for exit
+```
+
+Options for both: `host` (default `127.0.0.1`), `port` (default `6379`, `0` =
+ephemeral), `dbPath` (default `./data.db`, `":memory:"` for non-persistent),
+`password`, `reaperIntervalMs`. `spawnServer` additionally takes `bunPath` and
+`readyTimeoutMs`. The returned `url` already embeds the password when set.
+
+### Standalone daemon — CLI
+
+```bash
+bunx bun-resp-sqlite --port 6379 --db ./data.db
+# (in this repo: bun run src/cli.ts)
 # flags (or env): --host/REDIS_HOST  --port/REDIS_PORT
 #                 --db/REDIS_DB_PATH (":memory:" for in-memory)
 #                 --password/REDIS_PASSWORD
 ```
 
-Then from any app:
+stdout prints one JSON ready line (`{"event":"bun-resp-sqlite:ready",...}`);
+human logs go to stderr. Then from any app:
 
 ```ts
 import { RedisClient } from "bun";
@@ -57,6 +111,9 @@ of wire compatibility.
 
 ```
 src/
+  index.ts           public API (embedServer / spawnServer / startServer)
+  cli.ts             standalone daemon entry (bunx bun-resp-sqlite)
+  launch.ts          embed / spawn launchers
   server.ts          L1 transport (Bun.listen)
   resp/              L2 RESP3 parser + serializer
   connection.ts      L3 per-connection state machine
