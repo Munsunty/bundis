@@ -1,6 +1,6 @@
 {
   "name": "bundis",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "RESP3-compatible server backed by SQLite — works with the stock Bun.RedisClient",
   "license": "MIT",
   "type": "module",
