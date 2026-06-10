@@ -17,25 +17,57 @@ import {
 } from "../engine/errors";
 import type { RedisType, SetOptions, StorageEngine } from "./types";
 
+const ENC = new TextEncoder();
+
+/** Max expired keys reclaimed per sweep call (bounds reaper-tick stalls). */
+const SWEEP_BATCH = 1000;
+
 export interface SqliteStorageOptions {
   /** Hook invoked with a key whenever it is mutated (drives WATCH versioning). */
   readonly onWrite?: (key: Uint8Array) => void;
+  /** Hook invoked after FLUSHDB/FLUSHALL (per-key hooks can't enumerate). */
+  readonly onFlushAll?: () => void;
+  /** SQLite page-cache size in KB (PRAGMA cache_size). Default: SQLite's own. */
+  readonly pageCacheKb?: number;
 }
 
 export class SqliteStorage implements StorageEngine {
   #db: Database;
   #onWrite: (key: Uint8Array) => void;
+  #onFlushAll: () => void;
 
   constructor(path = ":memory:", opts: SqliteStorageOptions = {}) {
-    this.#db = new Database(path, { create: true, strict: false });
-    this.#onWrite = opts.onWrite ?? (() => {});
-    this.#init();
+    try {
+      this.#db = new Database(path, { create: true, strict: false });
+      this.#onWrite = opts.onWrite ?? (() => {});
+      this.#onFlushAll = opts.onFlushAll ?? (() => {});
+      this.#init(opts.pageCacheKb);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/locked|busy/i.test(msg)) {
+        throw new Error(
+          `database "${path}" is already in use by another bundis process ` +
+            "(the single-writer contract forbids sharing one .db file)",
+        );
+      }
+      throw new Error(`cannot open database "${path}": ${msg}`);
+    }
   }
 
-  #init(): void {
+  #init(pageCacheKb?: number): void {
+    // Enforce the documented single-writer contract (§5.3): EXCLUSIVE locking
+    // holds the file lock for the process lifetime, so a second bundis on the
+    // same .db fails fast here instead of corrupting cache coherence later.
+    // (:memory: is unaffected; WAL+exclusive runs with a heap WAL-index.)
+    this.#db.exec("PRAGMA busy_timeout = 2000;");
+    this.#db.exec("PRAGMA locking_mode = EXCLUSIVE;");
     this.#db.exec("PRAGMA journal_mode = WAL;");
     this.#db.exec("PRAGMA synchronous = NORMAL;");
     this.#db.exec("PRAGMA foreign_keys = ON;");
+    if (pageCacheKb !== undefined && pageCacheKb > 0) {
+      // negative value = size in KB (positive would mean pages)
+      this.#db.exec(`PRAGMA cache_size = -${Math.floor(pageCacheKb)};`);
+    }
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS keys (
         key          BLOB PRIMARY KEY,
@@ -146,20 +178,41 @@ export class SqliteStorage implements StorageEngine {
     return true;
   }
 
+  /**
+   * One bounded sweep batch per call (the reaper ticks every ~100ms, so a
+   * burst of expirations is reclaimed incrementally instead of blocking every
+   * connection for one giant transaction — measured 380ms p99 before the cap).
+   */
   sweepExpired(now: number): number {
     return this.withTransaction(() => {
       const rows = this.#stmt(
-        "SELECT key FROM keys WHERE expire_at_ms IS NOT NULL AND expire_at_ms <= ?",
+        "DELETE FROM keys WHERE key IN (" +
+          "SELECT key FROM keys WHERE expire_at_ms IS NOT NULL AND expire_at_ms <= ? " +
+          `LIMIT ${SWEEP_BATCH}) RETURNING key`,
       ).all(now) as Array<{ key: Uint8Array }>;
-      for (const r of rows) this.#deleteKey(r.key);
+      for (const r of rows) this.#onWrite(r.key);
       return rows.length;
     });
   }
 
   dbsize(now: number): number {
-    this.sweepExpired(now);
-    const row = this.#stmt("SELECT COUNT(*) AS n FROM keys").get() as { n: number };
+    // Count live keys without sweeping: INFO/DBSIZE polling must never pay
+    // (or trigger) a reclamation pass.
+    const row = this.#stmt(
+      "SELECT COUNT(*) AS n FROM keys WHERE expire_at_ms IS NULL OR expire_at_ms > ?",
+    ).get(now) as { n: number };
     return row.n;
+  }
+
+  flushAll(): void {
+    this.withTransaction(() => {
+      // Children first: kv/hash_fields/set_members reference keys.
+      this.#stmt("DELETE FROM kv").run();
+      this.#stmt("DELETE FROM hash_fields").run();
+      this.#stmt("DELETE FROM set_members").run();
+      this.#stmt("DELETE FROM keys").run();
+    });
+    this.#onFlushAll();
   }
 
   // ── string / kv ─────────────────────────────────────────────────────────--
@@ -215,7 +268,7 @@ export class SqliteStorage implements StorageEngine {
         n = parseIntStrict(cur);
       }
       const next = n + delta;
-      const buf = new TextEncoder().encode(next.toString());
+      const buf = ENC.encode(next.toString());
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'string', NULL) " +
           "ON CONFLICT(key) DO UPDATE SET type='string'",
@@ -237,7 +290,7 @@ export class SqliteStorage implements StorageEngine {
       if (!Number.isFinite(next)) {
         throw new RespError("ERR", "increment would produce NaN or Infinity");
       }
-      const buf = new TextEncoder().encode(formatFloat(next));
+      const buf = ENC.encode(formatFloat(next));
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'string', NULL) " +
           "ON CONFLICT(key) DO UPDATE SET type='string'",
@@ -361,7 +414,7 @@ export class SqliteStorage implements StorageEngine {
       const cur = this.hGet(key, field, now);
       const n = cur === null ? 0n : parseIntStrict(cur);
       const next = n + delta;
-      this.hSet(key, [[field, new TextEncoder().encode(next.toString())]], now);
+      this.hSet(key, [[field, ENC.encode(next.toString())]], now);
       return next;
     });
   }
@@ -371,16 +424,16 @@ export class SqliteStorage implements StorageEngine {
       const cur = this.hGet(key, field, now);
       const n = cur === null ? 0 : parseFloatStrict(cur);
       const next = n + delta;
-      this.hSet(key, [[field, new TextEncoder().encode(formatFloat(next))]], now);
+      this.hSet(key, [[field, ENC.encode(formatFloat(next))]], now);
       return next;
     });
   }
 
   #dropIfEmptyHash(key: Uint8Array): void {
-    const row = this.#stmt(
-      "SELECT COUNT(*) AS n FROM hash_fields WHERE key = ?",
-    ).get(key) as { n: number };
-    if (row.n === 0) this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
+    // Existence probe, not COUNT(*): a 100k-field hash must not pay a full
+    // index scan on every HDEL just to learn it is non-empty.
+    const any = this.#stmt("SELECT 1 FROM hash_fields WHERE key = ? LIMIT 1").get(key);
+    if (any === null) this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
   }
 
   // ── set ────────────────────────────────────────────────────────────────---
@@ -449,15 +502,25 @@ export class SqliteStorage implements StorageEngine {
     count: number | null,
     now: number,
   ): Uint8Array[] | Uint8Array | null {
-    const members = this.sMembers(key, now);
+    if (!this.#expectType(key, "set", now)) {
+      return count === null ? null : [];
+    }
+    // Random selection stays in SQL: materializing all members into JS just to
+    // pick a few measured ~5ms per op on a 100k set.
     if (count === null) {
-      if (members.length === 0) return null;
-      return members[Math.floor(Math.random() * members.length)]!;
+      const row = this.#randomMember(key);
+      return row ?? null;
     }
     if (count >= 0) {
-      return shuffle(members).slice(0, count);
+      return (
+        this.#stmt(
+          "SELECT member FROM set_members WHERE key = ? ORDER BY random() LIMIT ?",
+        ).all(key, count) as Array<{ member: Uint8Array }>
+      ).map((r) => r.member);
     }
-    // Negative count: allow repeats, |count| elements.
+    // Negative count: |count| picks WITH repeats — needs independent draws, so
+    // the full-load path is genuinely required here.
+    const members = this.sMembers(key, now);
     const out: Uint8Array[] = [];
     if (members.length === 0) return out;
     for (let i = 0; i < -count; i++) {
@@ -472,24 +535,53 @@ export class SqliteStorage implements StorageEngine {
     now: number,
   ): Uint8Array[] | Uint8Array | null {
     return this.withTransaction(() => {
-      const members = this.sMembers(key, now);
-      if (count === null) {
-        if (members.length === 0) return null;
-        const pick = members[Math.floor(Math.random() * members.length)]!;
-        this.sRem(key, [pick], now);
-        return pick;
+      if (!this.#expectType(key, "set", now)) {
+        return count === null ? null : [];
       }
-      const picks = shuffle(members).slice(0, Math.max(0, count));
-      if (picks.length > 0) this.sRem(key, picks, now);
-      return picks;
+      if (count === null) {
+        // Single pop: uniform COUNT+OFFSET pick is ~3x cheaper than
+        // ORDER BY random() (no per-row random + top-k sort).
+        const member = this.#randomMember(key);
+        if (member === undefined) return null;
+        this.#stmt("DELETE FROM set_members WHERE key = ? AND member = ?").run(key, member);
+        this.#dropIfEmptySet(key);
+        this.#onWrite(key);
+        return member;
+      }
+      const k = Math.max(0, count);
+      const rows =
+        k === 0
+          ? []
+          : (this.#stmt(
+              "DELETE FROM set_members WHERE key = ? AND member IN (" +
+                "SELECT member FROM set_members WHERE key = ? ORDER BY random() LIMIT ?" +
+                ") RETURNING member",
+            ).all(key, key, k) as Array<{ member: Uint8Array }>);
+      if (rows.length > 0) {
+        this.#dropIfEmptySet(key);
+        this.#onWrite(key);
+      }
+      return rows.map((r) => r.member);
     });
   }
 
-  #dropIfEmptySet(key: Uint8Array): void {
+  /** Uniform random member of a set key, or undefined when empty. */
+  #randomMember(key: Uint8Array): Uint8Array | undefined {
+    const n = (
+      this.#stmt("SELECT COUNT(*) AS n FROM set_members WHERE key = ?").get(key) as {
+        n: number;
+      }
+    ).n;
+    if (n === 0) return undefined;
     const row = this.#stmt(
-      "SELECT COUNT(*) AS n FROM set_members WHERE key = ?",
-    ).get(key) as { n: number };
-    if (row.n === 0) this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
+      "SELECT member FROM set_members WHERE key = ? LIMIT 1 OFFSET ?",
+    ).get(key, Math.floor(Math.random() * n)) as { member: Uint8Array } | null;
+    return row?.member;
+  }
+
+  #dropIfEmptySet(key: Uint8Array): void {
+    const any = this.#stmt("SELECT 1 FROM set_members WHERE key = ? LIMIT 1").get(key);
+    if (any === null) this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
   }
 
   // ── atomicity / lifecycle ───────────────────────────────────────────────--
@@ -555,13 +647,4 @@ function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
   out.set(a, 0);
   out.set(b, a.length);
   return out;
-}
-
-function shuffle<T>(arr: T[]): T[] {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j]!, a[i]!];
-  }
-  return a;
 }

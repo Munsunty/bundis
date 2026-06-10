@@ -7,6 +7,7 @@
  */
 
 import { R, type Reply } from "../resp/types";
+import { Errors } from "../engine/errors";
 import type { CommandContext } from "../engine/context";
 
 export function sadd(ctx: CommandContext): Reply {
@@ -36,6 +37,7 @@ export function scard(ctx: CommandContext): Reply {
 
 export function srandmember(ctx: CommandContext): Reply {
   ctx.requireArgc(1);
+  if (ctx.argc > 2) throw Errors.syntax();
   const hasCount = ctx.argOpt(1) !== undefined;
   const count = hasCount ? Number(ctx.int(1)) : null;
   const res = ctx.storage.sRandMember(ctx.arg(0), count, ctx.nowMs);
@@ -48,11 +50,15 @@ export function srandmember(ctx: CommandContext): Reply {
 
 export function spop(ctx: CommandContext): Reply {
   ctx.requireArgc(1);
+  if (ctx.argc > 2) throw Errors.syntax();
   const hasCount = ctx.argOpt(1) !== undefined;
   const count = hasCount ? Number(ctx.int(1)) : null;
+  if (count !== null && count < 0) {
+    return R.error("ERR", "value is out of range, must be positive");
+  }
   const res = ctx.storage.sPop(ctx.arg(0), count, ctx.nowMs);
   if (count === null) {
     return res === null ? R.nullReply() : R.bulk(res as Uint8Array);
   }
-  return R.set((res as Uint8Array[]).map((m) => R.bulk(m)));
+  return R.array((res as Uint8Array[]).map((m) => R.bulk(m)));
 }

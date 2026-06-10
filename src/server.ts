@@ -13,8 +13,11 @@ import { dispatch } from "./dispatcher";
 import { ProtocolError } from "./resp/parser";
 import { R } from "./resp/types";
 import { SqliteStorage } from "./storage/sqlite";
+import { HotCacheStorage } from "./storage/cache";
+import type { StorageEngine } from "./storage/types";
 import { PubSubHub } from "./sidecar/pubsub";
-import { WatchRegistry } from "./sidecar/watch";
+import { releaseSnapshot, WatchRegistry } from "./sidecar/watch";
+import { MemoryGuard } from "./sidecar/memory-guard";
 import { ExpiryReaper } from "./sidecar/reaper";
 import type { ServerConfig } from "./config";
 import type { ServerContext } from "./engine/context";
@@ -30,37 +33,75 @@ export interface RunningServer {
 
 export function startServer(config: ServerConfig): RunningServer {
   const watch = new WatchRegistry();
-  const storage = new SqliteStorage(config.dbPath, { onWrite: watch.bump });
+  let cache: HotCacheStorage | null = null;
+  const sqlite = new SqliteStorage(config.dbPath, {
+    onWrite: (key) => {
+      watch.bump(key);
+      cache?.invalidate(key); // every mutation evicts its stale cache entry
+    },
+    onFlushAll: () => {
+      watch.bumpAll();
+      cache?.invalidateAll();
+    },
+    // 50% of the overall memory budget goes to the SQLite page cache.
+    pageCacheKb: Math.floor(config.maxMemoryBytes / 2 / 1024),
+  });
+  const storage: StorageEngine =
+    config.cacheMaxBytes > 0
+      ? (cache = new HotCacheStorage(sqlite, {
+          maxBytes: config.cacheMaxBytes,
+          baseIdleMs: config.cacheIdleMs,
+        }))
+      : sqlite;
   const hub = new PubSubHub();
   const ctx: ServerContext = { storage, hub, watch, config };
 
   const reaper = new ExpiryReaper(storage, config.reaperIntervalMs);
   reaper.start();
 
+  // Aggregate buffer ceiling across all connections (inbound parser + outbound
+  // backpressure), independent of per-connection caps.
+  const guard = new MemoryGuard(config.maxMemoryBytes);
+  let liveClients = 0;
   const listener: TCPSocketListener<Connection> = Bun.listen<Connection>({
     hostname: config.host,
     port: config.port,
     socket: {
       open(socket: Socket<Connection>) {
-        socket.data = new Connection(socket);
+        if (liveClients >= config.maxClients) {
+          socket.write("-ERR max number of clients reached\r\n");
+          socket.end();
+          return; // socket.data stays unset; close() skips it
+        }
+        liveClients++;
+        // Nagle interacts badly with small request/reply round-trips.
+        (socket as unknown as { setNoDelay?: (on: boolean) => void }).setNoDelay?.(true);
+        socket.data = new Connection(socket, guard);
       },
       data(socket: Socket<Connection>, chunk: Buffer) {
         const conn = socket.data;
-        conn.parser.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-        let commands;
         try {
-          commands = conn.parser.drain();
+          const before = conn.parser.bufferedBytes;
+          conn.parser.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+          const commands = conn.parser.drain();
+          // Account the net change in the inbound buffer against the global cap.
+          guard.add(conn.parser.bufferedBytes - before);
+          if (guard.overLimit) throw new ProtocolError("server memory limit reached");
+          const now = Date.now();
+          for (const command of commands) {
+            dispatch(conn, command, ctx, now);
+          }
         } catch (err) {
           if (err instanceof ProtocolError) {
             conn.send(R.error("ERR", `Protocol error: ${err.message}`));
-            socket.end();
-            return;
+          } else {
+            // Contain the blast radius to this connection — one bad socket
+            // must never take down the whole server.
+            console.error(`bundis: connection #${conn.id} error:`, err);
+            conn.send(R.error("ERR", "internal error"));
           }
-          throw err;
-        }
-        const now = Date.now();
-        for (const command of commands) {
-          dispatch(conn, command, ctx, now);
+          guard.sub(conn.parser.bufferedBytes); // releasing this connection's inbound bytes
+          socket.end();
         }
       },
       drain(socket: Socket<Connection>) {
@@ -69,8 +110,14 @@ export function startServer(config: ServerConfig): RunningServer {
       close(socket: Socket<Connection>) {
         const conn = socket.data;
         if (conn) {
+          liveClients--;
+          guard.sub(conn.parser.bufferedBytes); // release inbound bytes (markClosed releases outbound)
           conn.markClosed();
           hub.drop(conn);
+          if (conn.watch) {
+            releaseSnapshot(watch, conn.watch); // refcounted registry interest
+            conn.watch = null;
+          }
         }
       },
       error(socket: Socket<Connection>) {

@@ -60,17 +60,34 @@ await server.stop(); // kills the child and waits for exit
 
 Options for both: `host` (default `127.0.0.1`), `port` (default `6379`, `0` =
 ephemeral), `dbPath` (default `./data.db`, `":memory:"` for non-persistent),
-`password`, `reaperIntervalMs`. `spawnServer` additionally takes `bunPath` and
+`password`, `reaperIntervalMs`, `maxMemoryMb` (default `256` — overall memory
+budget: 50% SQLite page cache, 25% hot cache), `cacheMb` (hot-cache ceiling,
+default `maxMemoryMb/4`, `0` disables), `cacheIdleSec` (hot-cache base
+time-to-idle, default `300`). `spawnServer` additionally takes `bunPath` and
 `readyTimeoutMs`. The returned `url` already embeds the password when set.
+
+### Hot cache
+
+Every `SET` is written through to SQLite **and** kept in an in-memory hot cache;
+`GET`s served from memory skip SQLite entirely (~2.8x read throughput on hot
+working sets). Entries fall out after an idle period that grows with hit count
+(adaptive TTI, capped at 8x), under an LRU byte ceiling. The cache is a pure
+read accelerator — SQLite remains the source of truth, so durability and
+restart behavior are unchanged. Stats appear under `# Cache` in `INFO`.
 
 ### Standalone daemon — CLI
 
 ```bash
 bunx bundis --port 6379 --db ./data.db
 # (in this repo: bun run src/cli.ts)
-# flags (or env): --host/REDIS_HOST  --port/REDIS_PORT
+# flags (or env): --host/REDIS_HOST (default 127.0.0.1; use 0.0.0.0 to expose)
+#                 --port/REDIS_PORT
 #                 --db/REDIS_DB_PATH (":memory:" for in-memory)
 #                 --password/REDIS_PASSWORD
+#                 --max-memory-mb/REDIS_MAX_MEMORY_MB (default 256)
+#                 --cache-mb/REDIS_CACHE_MB (default maxMemory/4; 0 = off)
+#                 --cache-idle/REDIS_CACHE_IDLE_SEC (default 300)
+#                 --max-clients/REDIS_MAX_CLIENTS (default 10000)
 ```
 
 stdout prints one JSON ready line (`{"event":"bundis:ready",...}`);
@@ -89,12 +106,18 @@ await client.get("k"); // "v"
 - **String / numeric:** SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET), GET, GETSET,
   GETDEL, APPEND, STRLEN, DEL/UNLINK, EXISTS, INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT
 - **Multi-key:** MGET, MSET, MSETNX, SETEX, PSETEX, SETNX
-- **Expiry:** EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST
+- **Expiry:** EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT (with NX/XX/GT/LT), TTL, PTTL, PERSIST
 - **Hash:** HSET, HMSET, HSETNX, HGET, HMGET, HGETALL, HDEL, HEXISTS, HKEYS,
   HVALS, HLEN, HINCRBY, HINCRBYFLOAT
 - **Set:** SADD, SREM, SISMEMBER, SMEMBERS, SCARD, SRANDMEMBER, SPOP
 - **Pub/Sub:** SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH, PUBSUB
 - **Transactions:** MULTI, EXEC, DISCARD, WATCH, UNWATCH
+- **Server/admin:** TYPE, DBSIZE, FLUSHDB, FLUSHALL, CONFIG GET/SET, COMMAND
+
+The only supported client is the stock `Bun.RedisClient`, which always speaks
+RESP3 — that is the wire-compatibility contract, and the server is RESP3-only by
+design. Default bind is `127.0.0.1`; set `--host 0.0.0.0` (ideally with
+`--password`) to expose the server beyond loopback.
 
 ## Test
 

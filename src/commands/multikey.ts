@@ -44,15 +44,19 @@ export function msetnx(ctx: CommandContext): Reply {
 
 export function setex(ctx: CommandContext): Reply {
   ctx.requireExactArgc(3);
-  const atMs = ctx.nowMs + Number(ctx.int(1)) * 1000;
-  ctx.storage.kvSet(ctx.arg(0), ctx.arg(2), ctx.nowMs, { expireAtMs: atMs });
+  const seconds = Number(ctx.int(1));
+  if (seconds <= 0) throw Errors.invalidExpire("setex"); // Redis semantics
+  ctx.storage.kvSet(ctx.arg(0), ctx.arg(2), ctx.nowMs, {
+    expireAtMs: ctx.nowMs + seconds * 1000,
+  });
   return R.ok();
 }
 
 export function psetex(ctx: CommandContext): Reply {
   ctx.requireExactArgc(3);
-  const atMs = ctx.nowMs + Number(ctx.int(1));
-  ctx.storage.kvSet(ctx.arg(0), ctx.arg(2), ctx.nowMs, { expireAtMs: atMs });
+  const ms = Number(ctx.int(1));
+  if (ms <= 0) throw Errors.invalidExpire("psetex"); // Redis semantics
+  ctx.storage.kvSet(ctx.arg(0), ctx.arg(2), ctx.nowMs, { expireAtMs: ctx.nowMs + ms });
   return R.ok();
 }
 

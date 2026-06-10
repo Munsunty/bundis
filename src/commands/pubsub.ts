@@ -80,8 +80,12 @@ export function pubsub(ctx: CommandContext): Reply {
   ctx.requireArgc(1);
   const sub = ctx.upper(0);
   switch (sub) {
-    case "CHANNELS":
-      return R.array(ctx.server.hub.channelNames().map((c) => R.bulk(c)));
+    case "CHANNELS": {
+      const names = ctx.server.hub.channelNames();
+      const filtered =
+        ctx.argc >= 2 ? names.filter((c) => globMatch(ctx.str(1), c)) : names;
+      return R.array(filtered.map((c) => R.bulk(c)));
+    }
     case "NUMSUB": {
       const out: Reply[] = [];
       for (let i = 1; i < ctx.argc; i++) {
@@ -90,9 +94,28 @@ export function pubsub(ctx: CommandContext): Reply {
       }
       return R.array(out);
     }
+    case "NUMPAT":
+      if (ctx.argc !== 1) {
+        return R.error(
+          "ERR",
+          `Unknown PUBSUB subcommand or wrong number of arguments for '${ctx.str(0)}'`,
+        );
+      }
+      return R.int(ctx.server.hub.numPat());
     default:
-      return R.array([]);
+      return R.error(
+        "ERR",
+        `Unknown PUBSUB subcommand or wrong number of arguments for '${ctx.str(0)}'`,
+      );
   }
+}
+
+/** Minimal glob matcher (`*`, `?`) for PUBSUB CHANNELS [pattern]. */
+function globMatch(pattern: string, s: string): boolean {
+  const re = new RegExp(
+    "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
+  );
+  return re.test(s);
 }
 
 function rangeArgs(ctx: CommandContext, from: number): string[] {

@@ -38,6 +38,8 @@ export interface StorageEngine {
   sweepExpired(now: number): number;
   /** Total live key count (after lazy considerations are out of scope here). */
   dbsize(now: number): number;
+  /** Remove every key (FLUSHDB/FLUSHALL). */
+  flushAll(): void;
 
   // ── string / kv ─────────────────────────────────────────────────────────--
   kvGet(key: Uint8Array, now: number): Uint8Array | null;

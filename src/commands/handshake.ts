@@ -59,8 +59,12 @@ export function ping(ctx: CommandContext): Reply {
   return R.simple("PONG");
 }
 
-export function select(_ctx: CommandContext): Reply {
-  // Single logical DB; accept any index for client compatibility.
+export function select(ctx: CommandContext): Reply {
+  // Single logical DB (CLAUDE.md scope): index 0 is accepted, anything else is
+  // an honest error — silently mapping /1 onto /0's data would clobber it.
+  ctx.requireExactArgc(1);
+  const idx = Number(ctx.int(0));
+  if (idx !== 0) return R.error("ERR", "DB index is out of range");
   return R.ok();
 }
 
@@ -86,10 +90,29 @@ export function info(ctx: CommandContext): Reply {
     "# Clients",
     "connected_clients:1",
     "",
+    "# Memory",
+    `used_memory:${process.memoryUsage().rss}`,
+    `maxmemory:${ctx.server.config.maxMemoryBytes}`,
+    "maxmemory_policy:noeviction", // data lives in SQLite; only caches evict
+    "",
     "# Keyspace",
     `db0:keys=${ctx.storage.dbsize(ctx.nowMs)},expires=0,avg_ttl=0`,
     "",
   ];
+  const stats = (ctx.storage as { stats?: () => Record<string, number> }).stats?.();
+  if (stats) {
+    lines.push(
+      "# Cache",
+      `cache_entries:${stats.entries}`,
+      `cache_bytes:${stats.bytes}`,
+      `cache_max_bytes:${stats.maxBytes}`,
+      `cache_hits:${stats.hits}`,
+      `cache_misses:${stats.misses}`,
+      `cache_evicted_idle:${stats.evictedIdle}`,
+      `cache_evicted_lru:${stats.evictedLru}`,
+      "",
+    );
+  }
   return R.verbatim("txt", lines.join("\r\n"));
 }
 
