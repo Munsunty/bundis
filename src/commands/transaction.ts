@@ -12,7 +12,7 @@ import { R, type Reply } from "../resp/types";
 import { Errors } from "../engine/errors";
 import { executeCore } from "../dispatcher";
 import type { CommandContext } from "../engine/context";
-import { hashKey, type WatchSnapshot } from "../sidecar/watch";
+import { hashKey, releaseSnapshot, type WatchSnapshot } from "../sidecar/watch";
 
 export function multi(ctx: CommandContext): Reply {
   if (ctx.conn.txn) return R.error("ERR", "MULTI calls can not be nested");
@@ -23,7 +23,7 @@ export function multi(ctx: CommandContext): Reply {
 export function discard(ctx: CommandContext): Reply {
   if (!ctx.conn.txn) throw Errors.discardWithoutMulti();
   ctx.conn.txn = null;
-  ctx.conn.watch = null;
+  clearWatch(ctx);
   return R.ok();
 }
 
@@ -34,14 +34,14 @@ export function exec(ctx: CommandContext): Reply {
   conn.txn = null;
 
   if (txn.error) {
-    conn.watch = null;
+    clearWatch(ctx);
     throw Errors.execAbort();
   }
   if (conn.watch && isWatchDirty(conn.watch, ctx)) {
-    conn.watch = null;
+    clearWatch(ctx);
     return R.nullReply(); // a watched key changed → abort
   }
-  conn.watch = null;
+  clearWatch(ctx);
 
   const results = ctx.storage.withTransaction(() =>
     txn.queued.map((cmd) => {
@@ -58,28 +58,38 @@ export function watch(ctx: CommandContext): Reply {
   const snap: WatchSnapshot = ctx.conn.watch ?? new Map();
   for (let i = 0; i < ctx.argc; i++) {
     const key = ctx.arg(i);
-    snap.set(hashKey(key), { key, version: ctx.server.watch.version(key) });
+    const k = hashKey(key);
+    if (snap.has(k)) continue; // already watched: keep the earlier snapshot
+    snap.set(k, { key, version: ctx.server.watch.acquire(key) });
   }
   ctx.conn.watch = snap;
   return R.ok();
 }
 
 export function unwatch(ctx: CommandContext): Reply {
-  ctx.conn.watch = null;
+  clearWatch(ctx);
   return R.ok();
 }
 
 export function reset(ctx: CommandContext): Reply {
   ctx.conn.txn = null;
-  ctx.conn.watch = null;
+  clearWatch(ctx);
   ctx.server.hub.drop(ctx.conn);
   ctx.conn.state = "READY";
   return R.simple("RESET");
 }
 
+/** Drop the connection's WATCH snapshot, releasing registry interest. */
+function clearWatch(ctx: CommandContext): void {
+  if (ctx.conn.watch) {
+    releaseSnapshot(ctx.server.watch, ctx.conn.watch);
+    ctx.conn.watch = null;
+  }
+}
+
 function isWatchDirty(snap: WatchSnapshot, ctx: CommandContext): boolean {
   for (const { key, version } of snap.values()) {
-    if (ctx.server.watch.version(key) !== version) return true;
+    if (ctx.server.watch.peek(key) !== version) return true;
   }
   return false;
 }

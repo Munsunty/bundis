@@ -61,6 +61,8 @@ export const Errors = {
   syntax: () => new RespError("ERR", "syntax error"),
   notInt: () => new RespError("ERR", "value is not an integer or out of range"),
   notFloat: () => new RespError("ERR", "value is not a valid float"),
+  invalidExpire: (cmd: string) =>
+    new RespError("ERR", `invalid expire time in '${cmd}' command`),
   wrongArgs: (cmd: string) =>
     new RespError("ERR", `wrong number of arguments for '${cmd.toLowerCase()}' command`),
   unknownCmd: (cmd: string, args: string[]) =>
@@ -88,6 +90,8 @@ export function toRespError(err: unknown): RespError {
   if (err instanceof TypeMismatchError) return Errors.wrongType();
   if (err instanceof NotIntegerError) return Errors.notInt();
   if (err instanceof NotFloatError) return Errors.notFloat();
-  const msg = err instanceof Error ? err.message : String(err);
-  return new RespError("ERR", msg);
+  // Unknown internals (SQLite/IO/runtime): log server-side for the operator,
+  // never echo raw messages (paths, engine state) over the wire.
+  console.error("bundis: internal command error:", err);
+  return new RespError("ERR", "internal error");
 }

@@ -4,6 +4,9 @@
  * Walks a {@link Reply} tree and produces wire bytes. Bulk/verbatim lengths are
  * computed in **bytes** (not characters) so binary-safe values and multi-byte
  * UTF-8 are framed correctly. This is the only place RESP3 type bytes are chosen.
+ *
+ * RESP3 only by design: the sole supported client is the stock `Bun.RedisClient`,
+ * which always negotiates `HELLO 3` (§2.1). No RESP2 downgrade path exists.
  */
 
 import type { Reply } from "./types";

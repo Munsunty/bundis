@@ -35,4 +35,11 @@ describe("multi-key commands", () => {
     expect(await h.client.send("SETNX", ["k", "2"])).toBe(0);
     expect(await h.client.get("k")).toBe("1");
   });
+
+  test("setex/psetex reject non-positive expire times (Redis semantics)", async () => {
+    expect(h.client.send("SETEX", ["k", "0", "v"])).rejects.toThrow(/invalid expire time/);
+    expect(h.client.send("SETEX", ["k", "-5", "v"])).rejects.toThrow(/invalid expire time/);
+    expect(h.client.send("PSETEX", ["k", "0", "v"])).rejects.toThrow(/invalid expire time/);
+    expect(await h.client.get("k")).toBeNull(); // nothing was stored
+  });
 });

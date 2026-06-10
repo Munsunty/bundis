@@ -12,8 +12,12 @@ import { serialize } from "./resp/serializer";
 import { RespParser } from "./resp/parser";
 import type { Command, Reply } from "./resp/types";
 import type { WatchSnapshot } from "./sidecar/watch";
+import type { MemoryGuard } from "./sidecar/memory-guard";
 
 export type ConnState = "HANDSHAKE" | "READY" | "SUBSCRIBED";
+
+/** Hard ceiling for bytes queued toward one slow-reading client. */
+const MAX_OUTBOX_BYTES = 32 * 1024 * 1024;
 
 /** A buffered MULTI transaction. */
 export interface TxnState {
@@ -44,9 +48,16 @@ export class Connection {
 
   /** Bytes awaiting a `drain` event when the socket buffer was full. */
   #outbox: Uint8Array[] = [];
+  #outboxBytes = 0;
   #closed = false;
+  readonly #guard: MemoryGuard;
 
-  constructor(readonly socket: Socket<Connection>) {}
+  constructor(
+    readonly socket: Socket<Connection>,
+    guard: MemoryGuard,
+  ) {
+    this.#guard = guard;
+  }
 
   /** Total active (P)SUBSCRIBE count, used in reply frames. */
   subscriptionCount(): number {
@@ -68,13 +79,29 @@ export class Connection {
     if (this.#closed) return;
     if (this.#outbox.length > 0) {
       // Preserve ordering: once we're behind, everything queues.
-      this.#outbox.push(bytes);
+      this.#queue(bytes);
       return;
     }
     const written = this.socket.write(bytes);
     if (written < bytes.length) {
-      this.#outbox.push(bytes.subarray(written));
+      this.#queue(bytes.subarray(written));
     }
+  }
+
+  /**
+   * Queue backpressured bytes; a consumer that stops reading (e.g. a stalled
+   * subscriber under PUBLISH load) is disconnected at the cap rather than
+   * letting its outbox grow until the process OOMs.
+   */
+  #queue(bytes: Uint8Array): void {
+    this.#outboxBytes += bytes.length;
+    this.#guard.add(bytes.length);
+    if (this.#outboxBytes > MAX_OUTBOX_BYTES || this.#guard.overLimit) {
+      this.markClosed();
+      this.socket.end();
+      return;
+    }
+    this.#outbox.push(bytes);
   }
 
   /** Called from the socket `drain` handler: flush what we can, in order. */
@@ -82,6 +109,8 @@ export class Connection {
     while (this.#outbox.length > 0 && !this.#closed) {
       const chunk = this.#outbox[0]!;
       const written = this.socket.write(chunk);
+      this.#outboxBytes -= written;
+      this.#guard.sub(written);
       if (written < chunk.length) {
         this.#outbox[0] = chunk.subarray(written);
         return; // still backpressured
@@ -92,6 +121,8 @@ export class Connection {
 
   markClosed(): void {
     this.#closed = true;
+    this.#guard.sub(this.#outboxBytes);
     this.#outbox.length = 0;
+    this.#outboxBytes = 0;
   }
 }

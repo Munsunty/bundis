@@ -28,6 +28,15 @@ export interface LaunchOptions {
   password?: string;
   /** Active-expiry sweep interval in ms (default 100). */
   reaperIntervalMs?: number;
+  /**
+   * Overall memory budget in MB (default 256). Sizes the SQLite page cache
+   * (50%) and the hot cache default (25%). A budget, not a hard OS limit.
+   */
+  maxMemoryMb?: number;
+  /** Hot-cache ceiling in MB (default: maxMemoryMb/4; 0 disables the cache). */
+  cacheMb?: number;
+  /** Hot-cache base time-to-idle in seconds (default 300). */
+  cacheIdleSec?: number;
 }
 
 export interface EmbeddedServer {
@@ -77,6 +86,11 @@ export interface SpawnServerOptions extends LaunchOptions {
 export async function spawnServer(opts: SpawnServerOptions = {}): Promise<SpawnedServer> {
   const config = resolveConfig(opts);
   const cliPath = Bun.fileURLToPath(new URL("./cli.ts", import.meta.url));
+  // The password travels via environment, never argv — argv is visible to
+  // every local user in `ps` for the lifetime of the child.
+  const env: Record<string, string | undefined> = { ...process.env };
+  delete env.REDIS_PASSWORD;
+  if (config.password !== null) env.REDIS_PASSWORD = config.password;
   const proc = Bun.spawn(
     [
       opts.bunPath ?? process.execPath,
@@ -84,10 +98,12 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Spawne
       "--host", config.host,
       "--port", String(config.port),
       "--db", config.dbPath,
-      ...(config.password !== null ? ["--password", config.password] : []),
       "--reaper", String(config.reaperIntervalMs),
+      "--max-memory-mb", String(Math.floor(config.maxMemoryBytes / (1024 * 1024))),
+      "--cache-mb", String(Math.floor(config.cacheMaxBytes / (1024 * 1024))),
+      "--cache-idle", String(Math.floor(config.cacheIdleMs / 1000)),
     ],
-    { stdout: "pipe", stderr: "inherit" },
+    { stdout: "pipe", stderr: "inherit", env },
   );
 
   let ready: { host: string; port: number };
@@ -114,12 +130,20 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Spawne
 // ── helpers ──────────────────────────────────────────────────────────────---
 
 function resolveConfig(opts: LaunchOptions): ServerConfig {
+  const MB = 1024 * 1024;
+  const maxMemoryMb = opts.maxMemoryMb ?? 256;
   return {
     host: opts.host ?? "127.0.0.1",
     port: opts.port ?? 6379,
     dbPath: opts.dbPath ?? "./data.db",
-    password: opts.password ?? null,
+    // Honor flag > env > none, so an env-configured password is not silently
+    // dropped (which would launch an open server — fail-open regression).
+    password: opts.password ?? Bun.env.REDIS_PASSWORD ?? null,
     reaperIntervalMs: opts.reaperIntervalMs ?? 100,
+    maxClients: 10_000,
+    maxMemoryBytes: maxMemoryMb * MB,
+    cacheMaxBytes: (opts.cacheMb ?? Math.floor(maxMemoryMb / 4)) * MB,
+    cacheIdleMs: (opts.cacheIdleSec ?? 300) * 1000,
   };
 }
 

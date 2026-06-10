@@ -22,6 +22,7 @@ import * as hash from "./commands/hash";
 import * as set from "./commands/set";
 import * as pubsub from "./commands/pubsub";
 import * as txn from "./commands/transaction";
+import * as admin from "./commands/admin";
 
 /** A command handler. Returns the reply, or null if it wrote its own output. */
 export type Handler = (ctx: CommandContext) => Reply | null;
@@ -109,7 +110,20 @@ const TABLE: Record<string, Handler> = {
   WATCH: txn.watch,
   UNWATCH: txn.unwatch,
   RESET: txn.reset,
+
+  // server / admin
+  TYPE: admin.type,
+  DBSIZE: admin.dbsize,
+  FLUSHDB: admin.flushall, // single DB: FLUSHDB == FLUSHALL
+  FLUSHALL: admin.flushall,
+  CONFIG: admin.config,
+  COMMAND: admin.command,
 };
+
+/** Number of dispatchable commands (COMMAND COUNT). */
+export function commandCount(): number {
+  return Object.keys(TABLE).length;
+}
 
 /** Commands permitted while in SUBSCRIBED mode (§6.1). */
 const SUBSCRIBE_ALLOWED = new Set([
@@ -161,6 +175,16 @@ export function dispatch(
     if (!TABLE[command.name]) {
       conn.txn.error = true;
       conn.send(errReply(Errors.unknownCmd(command.name, argStrings(command))));
+      return;
+    }
+    if (SUBSCRIBE_ALLOWED.has(command.name) && command.name !== "PING" && command.name !== "QUIT") {
+      // (P)SUBSCRIBE/(P)UNSUBSCRIBE inside MULTI would flip the connection
+      // mode mid-EXEC and desync the client's reply matching (Redis rejects).
+      conn.txn.error = true;
+      conn.send(errReply({
+        code: "ERR",
+        message: `${command.name} is not allowed in transactions`,
+      }));
       return;
     }
     conn.txn.queued.push(command);

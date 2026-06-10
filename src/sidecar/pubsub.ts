@@ -79,6 +79,13 @@ export class PubSubHub {
   numSub(channel: string): number {
     return this.#channels.get(channel)?.size ?? 0;
   }
+
+  /** Count of distinct patterns with at least one subscriber. */
+  numPat(): number {
+    let n = 0;
+    for (const conns of this.#patterns.values()) if (conns.size > 0) n++;
+    return n;
+  }
 }
 
 function addTo(map: Map<string, Set<Connection>>, key: string, conn: Connection): void {

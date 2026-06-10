@@ -24,14 +24,20 @@ export function set(ctx: CommandContext): Reply {
   while (ctx.argOpt(i) !== undefined) {
     const o = ctx.upper(i);
     switch (o) {
-      case "EX":
-        opts.expireAtMs = ctx.nowMs + Number(ctx.int(i + 1)) * 1000;
+      case "EX": {
+        const sec = Number(ctx.int(i + 1));
+        if (sec <= 0) throw Errors.invalidExpire("set"); // Redis semantics
+        opts.expireAtMs = ctx.nowMs + sec * 1000;
         i += 2;
         break;
-      case "PX":
-        opts.expireAtMs = ctx.nowMs + Number(ctx.int(i + 1));
+      }
+      case "PX": {
+        const ms = Number(ctx.int(i + 1));
+        if (ms <= 0) throw Errors.invalidExpire("set");
+        opts.expireAtMs = ctx.nowMs + ms;
         i += 2;
         break;
+      }
       case "EXAT":
         opts.expireAtMs = Number(ctx.int(i + 1)) * 1000;
         i += 2;
@@ -61,13 +67,20 @@ export function set(ctx: CommandContext): Reply {
     }
   }
 
-  let old: Uint8Array | null = null;
-  const result = ctx.storage.withTransaction(() => {
-    if (wantGet) old = ctx.storage.kvGet(key, ctx.nowMs);
-    return ctx.storage.kvSet(key, value, ctx.nowMs, opts);
-  });
-
-  if (wantGet) return R.bulk(old);
+  if (wantGet) {
+    // GET option returns the old value whether or not the write happened; it
+    // needs read-then-write atomicity, so the cache fill is suppressed inside
+    // this transaction (correct — a rollback must not cache a phantom).
+    let old: Uint8Array | null = null;
+    ctx.storage.withTransaction(() => {
+      old = ctx.storage.kvGet(key, ctx.nowMs);
+      ctx.storage.kvSet(key, value, ctx.nowMs, opts);
+    });
+    return R.bulk(old);
+  }
+  // Plain SET: kvSet is already internally transactional, so we DON'T wrap it —
+  // wrapping would set #inTxn and suppress the hot-cache write-through fill.
+  const result = ctx.storage.kvSet(key, value, ctx.nowMs, opts);
   return result === "set" ? R.ok() : R.nullReply();
 }
 

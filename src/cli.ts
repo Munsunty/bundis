@@ -36,3 +36,17 @@ function shutdown(): void {
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// Last-resort backstop: log, try to close storage cleanly, exit non-zero.
+process.on("uncaughtException", (err) => {
+  console.error("bundis: uncaught exception:", err);
+  try {
+    running.stop();
+  } catch {
+    // already torn down
+  }
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("bundis: unhandled rejection:", err);
+});
