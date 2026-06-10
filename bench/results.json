@@ -1,0 +1,95 @@
+{
+  "meta": {
+    "date": "2026-06-10T04:25:35.419Z",
+    "quick": false,
+    "durationSec": 32,
+    "bun": "1.3.14",
+    "platform": "darwin 25.5.0",
+    "cpu": "Apple M5",
+    "cores": 10,
+    "memGB": 24,
+    "commit": "1b62336",
+    "config": {
+      "serverMode": "spawnServer (separate process); embed only in G1",
+      "db": "file-backed WAL in tmpdir (fresh per case); :memory: only in E1 ceiling leg",
+      "client": "stock Bun.RedisClient, autoReconnect off",
+      "reaperIntervalMs": "100 (default) unless a case overrides"
+    }
+  },
+  "cases": [
+    {
+      "id": "F3",
+      "name": "open-loop GET latency @5k/s during TTL churn",
+      "params": {
+        "rate": 5000,
+        "samples": 25000,
+        "ttlKeys": 50000
+      },
+      "metrics": {
+        "baseline": {
+          "n": 25000,
+          "p50us": 803.2,
+          "p95us": 1406.7,
+          "p99us": 2607.9,
+          "maxUs": 7716.5,
+          "meanUs": 840.9,
+          "achievedRate": 5000
+        },
+        "staggeredExpiry": {
+          "n": 25000,
+          "p50us": 891,
+          "p95us": 15610.7,
+          "p99us": 21417.1,
+          "maxUs": 26337.9,
+          "meanUs": 2735.8,
+          "achievedRate": 4999
+        },
+        "burstExpiry": {
+          "n": 25000,
+          "p50us": 833.1,
+          "p95us": 9008.5,
+          "p99us": 14134.5,
+          "maxUs": 23384.8,
+          "meanUs": 1639.4,
+          "achievedRate": 5000
+        }
+      }
+    },
+    {
+      "id": "H1",
+      "name": "collection cardinality costs",
+      "params": {
+        "sizes": [
+          1000,
+          10000,
+          100000
+        ]
+      },
+      "metrics": {
+        "card1000": {
+          "hgetallMeanMs": 0.4,
+          "smembersMeanMs": 0.2
+        },
+        "card10000": {
+          "hgetallMeanMs": 3.6,
+          "smembersMeanMs": 1.5
+        },
+        "card100000": {
+          "hgetallMeanMs": 57.1,
+          "smembersMeanMs": 16.8
+        },
+        "singleMemberOnBig": {
+          "setCard": 100000,
+          "srandmemberMeanUs": 1701.8,
+          "spopMeanUs": 1699.5
+        },
+        "delWholeCollectionMs": {
+          "H10000": 5.1,
+          "S10000": 4.4,
+          "H100000": 53.4,
+          "S100000": 42.8
+        }
+      }
+    }
+  ]
+}

@@ -1,25 +1,32 @@
 {
   "name": "bundis",
   "version": "0.2.0",
-  "description": "RESP3-compatible server backed by SQLite — works with the stock Bun.RedisClient",
-  "license": "MIT",
-  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Munsunty/bundis.git"
+  },
   "module": "src/index.ts",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
   "exports": {
     ".": "./src/index.ts"
   },
   "bin": {
     "bundis": "src/cli.ts"
   },
+  "description": "RESP3-compatible server backed by SQLite — works with the stock Bun.RedisClient",
+  "engines": {
+    "bun": ">=1.1.0"
+  },
   "files": [
     "src",
     "README.md",
     "CLAUDE.md"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Munsunty/bundis.git"
-  },
   "keywords": [
     "redis",
     "resp",
@@ -29,19 +36,12 @@
     "redis-server",
     "embedded"
   ],
-  "engines": {
-    "bun": ">=1.1.0"
-  },
+  "license": "MIT",
   "scripts": {
     "start": "bun run src/cli.ts",
     "dev": "bun --watch run src/cli.ts",
     "test": "bun test",
     "typecheck": "bun x tsc --noEmit"
   },
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  }
+  "type": "module"
 }
