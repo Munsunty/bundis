@@ -15,12 +15,40 @@ import {
   RespError,
   TypeMismatchError,
 } from "../engine/errors";
-import type { RedisType, SetOptions, StorageEngine } from "./types";
+import type {
+  RedisType,
+  ScoreBound,
+  SetOptions,
+  StorageEngine,
+  ZAddOptions,
+} from "./types";
 
 const ENC = new TextEncoder();
 
 /** Max expired keys reclaimed per sweep call (bounds reaper-tick stalls). */
 const SWEEP_BATCH = 1000;
+
+/**
+ * Zset range/rank SQL, exported so the query-plan regression tests can assert
+ * these statements stay on the (key, score, member) index — no full scans, no
+ * temp B-tree sorts (the performance contract for ZRANGE/ZRANGEBYSCORE/ZRANK).
+ * LIMIT -1 means "no limit" in SQLite, so one shape covers the LIMIT-less case.
+ */
+export const ZSET_RANGE_SQL = {
+  byRankAsc:
+    "SELECT member, score FROM zset_members WHERE key = ? " +
+    "ORDER BY score, member LIMIT ? OFFSET ?",
+  byRankDesc:
+    "SELECT member, score FROM zset_members WHERE key = ? " +
+    "ORDER BY score DESC, member DESC LIMIT ? OFFSET ?",
+  byScore: (minOp: ">" | ">=", maxOp: "<" | "<="): string =>
+    "SELECT member, score FROM zset_members WHERE key = ? " +
+    `AND score ${minOp} ? AND score ${maxOp} ? ` +
+    "ORDER BY score, member LIMIT ? OFFSET ?",
+  rank:
+    "SELECT COUNT(*) AS n FROM zset_members WHERE key = ? " +
+    "AND (score < ? OR (score = ? AND member < ?))",
+} as const;
 
 export interface SqliteStorageOptions {
   /** Hook invoked with a key whenever it is mutated (drives WATCH versioning). */
@@ -93,6 +121,22 @@ export class SqliteStorage implements StorageEngine {
         PRIMARY KEY (key, member),
         FOREIGN KEY (key) REFERENCES keys(key) ON DELETE CASCADE
       ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS list_items (
+        key   BLOB NOT NULL,
+        seq   INTEGER NOT NULL,
+        value BLOB NOT NULL,
+        PRIMARY KEY (key, seq),
+        FOREIGN KEY (key) REFERENCES keys(key) ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS zset_members (
+        key    BLOB NOT NULL,
+        member BLOB NOT NULL,
+        score  REAL NOT NULL,
+        PRIMARY KEY (key, member),
+        FOREIGN KEY (key) REFERENCES keys(key) ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS idx_zset_range
+        ON zset_members(key, score, member);
     `);
   }
 
@@ -206,10 +250,12 @@ export class SqliteStorage implements StorageEngine {
 
   flushAll(): void {
     this.withTransaction(() => {
-      // Children first: kv/hash_fields/set_members reference keys.
+      // Children first: value tables reference keys.
       this.#stmt("DELETE FROM kv").run();
       this.#stmt("DELETE FROM hash_fields").run();
       this.#stmt("DELETE FROM set_members").run();
+      this.#stmt("DELETE FROM list_items").run();
+      this.#stmt("DELETE FROM zset_members").run();
       this.#stmt("DELETE FROM keys").run();
     });
     this.#onFlushAll();
@@ -584,6 +630,313 @@ export class SqliteStorage implements StorageEngine {
     if (any === null) this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
   }
 
+  // ── list ───────────────────────────────────────────────────────────────---
+  //
+  // Invariant: a list's seqs always form a contiguous integer interval
+  // [min, max], because the supported ops only push/pop at the two ends.
+  // This makes LINDEX a point lookup (seq = min + rank) and LRANGE a pure
+  // BETWEEN index-range scan — no OFFSET. Adding LREM/LINSERT/LSET later
+  // breaks this invariant and requires renumbering (or a different scheme).
+
+  /** Live seq interval of a list key, or null when it has no rows. */
+  #listBounds(key: Uint8Array): { min: number; max: number } | null {
+    const row = this.#stmt(
+      "SELECT MIN(seq) AS mn, MAX(seq) AS mx FROM list_items WHERE key = ?",
+    ).get(key) as { mn: number | null; mx: number | null };
+    if (row.mn === null) return null;
+    return { min: row.mn, max: row.mx! };
+  }
+
+  lPush(key: Uint8Array, values: Uint8Array[], now: number): number {
+    return this.#push(key, values, "L", now);
+  }
+
+  rPush(key: Uint8Array, values: Uint8Array[], now: number): number {
+    return this.#push(key, values, "R", now);
+  }
+
+  #push(key: Uint8Array, values: Uint8Array[], side: "L" | "R", now: number): number {
+    return this.withTransaction(() => {
+      this.#expectType(key, "list", now);
+      this.#stmt(
+        "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'list', NULL) " +
+          "ON CONFLICT(key) DO NOTHING",
+      ).run(key);
+      const bounds = this.#listBounds(key);
+      let min = bounds ? bounds.min : 0;
+      let max = bounds ? bounds.max : -1;
+      const ins = this.#stmt("INSERT INTO list_items(key, seq, value) VALUES (?, ?, ?)");
+      for (const v of values) {
+        if (side === "L") ins.run(key, --min, v);
+        else ins.run(key, ++max, v);
+      }
+      this.#onWrite(key);
+      return max - min + 1;
+    });
+  }
+
+  lPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null {
+    return this.#pop(key, count, "L", now);
+  }
+
+  rPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null {
+    return this.#pop(key, count, "R", now);
+  }
+
+  #pop(
+    key: Uint8Array,
+    count: number | null,
+    side: "L" | "R",
+    now: number,
+  ): Uint8Array[] | Uint8Array | null {
+    return this.withTransaction(() => {
+      // Missing key pops to null even with a count (unlike SPOP's empty array).
+      if (!this.#expectType(key, "list", now)) return null;
+      const bounds = this.#listBounds(key);
+      if (!bounds) return null; // unreachable: empty lists drop their key row
+      const len = bounds.max - bounds.min + 1;
+      const k = count === null ? 1 : Math.min(count, len);
+      if (k === 0) return [];
+      // Pop order: heads ascending from min, tails descending from max.
+      const lo = side === "L" ? bounds.min : bounds.max - k + 1;
+      const hi = side === "L" ? bounds.min + k - 1 : bounds.max;
+      const rows = this.#stmt(
+        "SELECT value FROM list_items WHERE key = ? AND seq BETWEEN ? AND ? " +
+          `ORDER BY seq ${side === "L" ? "ASC" : "DESC"}`,
+      ).all(key, lo, hi) as Array<{ value: Uint8Array }>;
+      this.#stmt("DELETE FROM list_items WHERE key = ? AND seq BETWEEN ? AND ?").run(
+        key,
+        lo,
+        hi,
+      );
+      this.#dropIfEmptyList(key);
+      this.#onWrite(key);
+      const values = rows.map((r) => r.value);
+      return count === null ? values[0]! : values;
+    });
+  }
+
+  lRange(key: Uint8Array, start: number, stop: number, now: number): Uint8Array[] {
+    if (!this.#expectType(key, "list", now)) return [];
+    const bounds = this.#listBounds(key);
+    if (!bounds) return [];
+    const len = bounds.max - bounds.min + 1;
+    const s = Math.max(0, start < 0 ? len + start : start);
+    const e = Math.min(len - 1, stop < 0 ? len + stop : stop);
+    if (s > e) return [];
+    return (
+      this.#stmt(
+        "SELECT value FROM list_items WHERE key = ? AND seq BETWEEN ? AND ? ORDER BY seq",
+      ).all(key, bounds.min + s, bounds.min + e) as Array<{ value: Uint8Array }>
+    ).map((r) => r.value);
+  }
+
+  lLen(key: Uint8Array, now: number): number {
+    if (!this.#expectType(key, "list", now)) return 0;
+    const row = this.#stmt(
+      "SELECT COUNT(*) AS n FROM list_items WHERE key = ?",
+    ).get(key) as { n: number };
+    return row.n;
+  }
+
+  lIndex(key: Uint8Array, index: number, now: number): Uint8Array | null {
+    if (!this.#expectType(key, "list", now)) return null;
+    const bounds = this.#listBounds(key);
+    if (!bounds) return null;
+    const len = bounds.max - bounds.min + 1;
+    const i = index < 0 ? len + index : index;
+    if (i < 0 || i >= len) return null;
+    const row = this.#stmt(
+      "SELECT value FROM list_items WHERE key = ? AND seq = ?",
+    ).get(key, bounds.min + i) as { value: Uint8Array } | null;
+    return row ? row.value : null;
+  }
+
+  #dropIfEmptyList(key: Uint8Array): void {
+    const any = this.#stmt("SELECT 1 FROM list_items WHERE key = ? LIMIT 1").get(key);
+    if (any === null) this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
+  }
+
+  // ── zset ───────────────────────────────────────────────────────────────---
+
+  zAdd(
+    key: Uint8Array,
+    entries: ReadonlyArray<readonly [number, Uint8Array]>,
+    now: number,
+    opts: ZAddOptions = {},
+  ): number {
+    return this.withTransaction(() => {
+      this.#expectType(key, "zset", now);
+      const get = this.#stmt("SELECT score FROM zset_members WHERE key = ? AND member = ?");
+      const ins = this.#stmt("INSERT INTO zset_members(key, member, score) VALUES (?, ?, ?)");
+      const upd = this.#stmt(
+        "UPDATE zset_members SET score = ? WHERE key = ? AND member = ?",
+      );
+      // XX against a missing key must not create an empty key row, so the
+      // keys upsert is deferred until the first member actually lands.
+      let keyEnsured = false;
+      let added = 0;
+      let changed = 0;
+      for (const [score, member] of entries) {
+        const cur = get.get(key, member) as { score: number } | null;
+        if (cur === null) {
+          if (opts.mode === "XX") continue;
+          if (!keyEnsured) {
+            this.#stmt(
+              "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'zset', NULL) " +
+                "ON CONFLICT(key) DO NOTHING",
+            ).run(key);
+            keyEnsured = true;
+          }
+          ins.run(key, member, score);
+          added++;
+        } else {
+          if (opts.mode === "NX") continue;
+          if (opts.gt && !(score > cur.score)) continue;
+          if (opts.lt && !(score < cur.score)) continue;
+          if (score !== cur.score) {
+            upd.run(score, key, member);
+            changed++;
+          }
+        }
+      }
+      this.#onWrite(key);
+      return added + (opts.ch ? changed : 0);
+    });
+  }
+
+  zIncr(
+    key: Uint8Array,
+    delta: number,
+    member: Uint8Array,
+    now: number,
+    opts: ZAddOptions = {},
+  ): number | null {
+    return this.withTransaction(() => {
+      this.#expectType(key, "zset", now);
+      const cur = this.#stmt(
+        "SELECT score FROM zset_members WHERE key = ? AND member = ?",
+      ).get(key, member) as { score: number } | null;
+      if (cur === null) {
+        if (opts.mode === "XX") return null;
+        this.#stmt(
+          "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'zset', NULL) " +
+            "ON CONFLICT(key) DO NOTHING",
+        ).run(key);
+        this.#stmt("INSERT INTO zset_members(key, member, score) VALUES (?, ?, ?)").run(
+          key,
+          member,
+          delta,
+        );
+        this.#onWrite(key);
+        return delta;
+      }
+      if (opts.mode === "NX") return null;
+      const next = cur.score + delta;
+      if (Number.isNaN(next)) {
+        throw new RespError("ERR", "resulting score is not a number (NaN)");
+      }
+      if (opts.gt && !(next > cur.score)) return null;
+      if (opts.lt && !(next < cur.score)) return null;
+      this.#stmt("UPDATE zset_members SET score = ? WHERE key = ? AND member = ?").run(
+        next,
+        key,
+        member,
+      );
+      this.#onWrite(key);
+      return next;
+    });
+  }
+
+  zScore(key: Uint8Array, member: Uint8Array, now: number): number | null {
+    if (!this.#expectType(key, "zset", now)) return null;
+    const row = this.#stmt(
+      "SELECT score FROM zset_members WHERE key = ? AND member = ?",
+    ).get(key, member) as { score: number } | null;
+    return row ? row.score : null;
+  }
+
+  zCard(key: Uint8Array, now: number): number {
+    if (!this.#expectType(key, "zset", now)) return 0;
+    const row = this.#stmt(
+      "SELECT COUNT(*) AS n FROM zset_members WHERE key = ?",
+    ).get(key) as { n: number };
+    return row.n;
+  }
+
+  zRem(key: Uint8Array, members: Uint8Array[], now: number): number {
+    return this.withTransaction(() => {
+      if (!this.#expectType(key, "zset", now)) return 0;
+      const del = this.#stmt("DELETE FROM zset_members WHERE key = ? AND member = ?");
+      let n = 0;
+      for (const m of members) n += (del.run(key, m) as { changes: number }).changes;
+      this.#dropIfEmptyZset(key);
+      this.#onWrite(key);
+      return n;
+    });
+  }
+
+  zRank(key: Uint8Array, member: Uint8Array, now: number): number | null {
+    if (!this.#expectType(key, "zset", now)) return null;
+    const cur = this.#stmt(
+      "SELECT score FROM zset_members WHERE key = ? AND member = ?",
+    ).get(key, member) as { score: number } | null;
+    if (cur === null) return null;
+    // Count predecessors via an index range scan — O(rank), the best SQLite
+    // offers without an auxiliary order-statistic structure.
+    const row = this.#stmt(ZSET_RANGE_SQL.rank).get(key, cur.score, cur.score, member) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  zRangeByRank(
+    key: Uint8Array,
+    start: number,
+    stop: number,
+    rev: boolean,
+    now: number,
+  ): Array<[Uint8Array, number]> {
+    if (!this.#expectType(key, "zset", now)) return [];
+    const len = this.zCard(key, now);
+    const s = Math.max(0, start < 0 ? len + start : start);
+    const e = Math.min(len - 1, stop < 0 ? len + stop : stop);
+    if (s > e) return [];
+    // LIMIT/OFFSET here skips entries inside the (key, score, member) index
+    // run — same O(start + n) class as the ZRANK count-scan, no row
+    // materialization and no sort (guarded by the query-plan test).
+    const rows = this.#stmt(
+      rev ? ZSET_RANGE_SQL.byRankDesc : ZSET_RANGE_SQL.byRankAsc,
+    ).all(key, e - s + 1, s) as Array<{ member: Uint8Array; score: number }>;
+    return rows.map((r) => [r.member, r.score]);
+  }
+
+  zRangeByScore(
+    key: Uint8Array,
+    min: ScoreBound,
+    max: ScoreBound,
+    limit: { offset: number; count: number } | null,
+    now: number,
+  ): Array<[Uint8Array, number]> {
+    if (!this.#expectType(key, "zset", now)) return [];
+    // ±Infinity binds as a REAL and compares correctly, so unbounded sides
+    // need no special-casing. count < 0 (and the no-LIMIT case) maps to
+    // SQLite's LIMIT -1 = unlimited.
+    const sql = ZSET_RANGE_SQL.byScore(min.exclusive ? ">" : ">=", max.exclusive ? "<" : "<=");
+    const count = limit === null || limit.count < 0 ? -1 : limit.count;
+    const offset = limit === null ? 0 : limit.offset;
+    const rows = this.#stmt(sql).all(key, min.value, max.value, count, offset) as Array<{
+      member: Uint8Array;
+      score: number;
+    }>;
+    return rows.map((r) => [r.member, r.score]);
+  }
+
+  #dropIfEmptyZset(key: Uint8Array): void {
+    const any = this.#stmt("SELECT 1 FROM zset_members WHERE key = ? LIMIT 1").get(key);
+    if (any === null) this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
+  }
+
   // ── atomicity / lifecycle ───────────────────────────────────────────────--
 
   withTransaction<T>(fn: () => T): T {
@@ -595,6 +948,19 @@ export class SqliteStorage implements StorageEngine {
 
   close(): void {
     this.#db.close();
+  }
+
+  /**
+   * Test-only: EXPLAIN QUERY PLAN detail lines for `sql` (the performance
+   * regression guard asserts index usage without flaky timing measurements).
+   */
+  explainQueryPlan(sql: string): string[] {
+    // Bind NULL for every placeholder: values never change the plan shape.
+    const params = (sql.match(/\?/g) ?? []).map(() => null);
+    const rows = this.#db.query(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{
+      detail: string;
+    }>;
+    return rows.map((r) => r.detail);
   }
 
   // ── statement cache ─────────────────────────────────────────────────────--

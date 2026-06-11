@@ -20,6 +20,8 @@ import * as expire from "./commands/expire";
 import * as multikey from "./commands/multikey";
 import * as hash from "./commands/hash";
 import * as set from "./commands/set";
+import * as list from "./commands/list";
+import * as zset from "./commands/zset";
 import * as pubsub from "./commands/pubsub";
 import * as txn from "./commands/transaction";
 import * as admin from "./commands/admin";
@@ -94,6 +96,25 @@ const TABLE: Record<string, Handler> = {
   SCARD: set.scard,
   SRANDMEMBER: set.srandmember,
   SPOP: set.spop,
+
+  // list
+  LPUSH: list.lpush,
+  RPUSH: list.rpush,
+  LPOP: list.lpop,
+  RPOP: list.rpop,
+  LRANGE: list.lrange,
+  LLEN: list.llen,
+  LINDEX: list.lindex,
+
+  // zset
+  ZADD: zset.zadd,
+  ZRANGE: zset.zrange,
+  ZREVRANGE: zset.zrevrange,
+  ZRANGEBYSCORE: zset.zrangebyscore,
+  ZSCORE: zset.zscore,
+  ZRANK: zset.zrank,
+  ZCARD: zset.zcard,
+  ZREM: zset.zrem,
 
   // pub/sub
   SUBSCRIBE: pubsub.subscribe,

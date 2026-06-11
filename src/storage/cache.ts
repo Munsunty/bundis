@@ -25,7 +25,13 @@
  *   expired key never serves from cache.
  */
 
-import type { RedisType, SetOptions, StorageEngine } from "./types";
+import type {
+  RedisType,
+  ScoreBound,
+  SetOptions,
+  StorageEngine,
+  ZAddOptions,
+} from "./types";
 
 interface CacheEntry {
   value: Uint8Array;
@@ -291,6 +297,74 @@ export class HotCacheStorage implements StorageEngine {
   }
   sPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null {
     return this.inner.sPop(key, count, now);
+  }
+  lPush(key: Uint8Array, values: Uint8Array[], now: number): number {
+    return this.inner.lPush(key, values, now);
+  }
+  rPush(key: Uint8Array, values: Uint8Array[], now: number): number {
+    return this.inner.rPush(key, values, now);
+  }
+  lPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null {
+    return this.inner.lPop(key, count, now);
+  }
+  rPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null {
+    return this.inner.rPop(key, count, now);
+  }
+  lRange(key: Uint8Array, start: number, stop: number, now: number): Uint8Array[] {
+    return this.inner.lRange(key, start, stop, now);
+  }
+  lLen(key: Uint8Array, now: number): number {
+    return this.inner.lLen(key, now);
+  }
+  lIndex(key: Uint8Array, index: number, now: number): Uint8Array | null {
+    return this.inner.lIndex(key, index, now);
+  }
+  zAdd(
+    key: Uint8Array,
+    entries: ReadonlyArray<readonly [number, Uint8Array]>,
+    now: number,
+    opts?: ZAddOptions,
+  ): number {
+    return this.inner.zAdd(key, entries, now, opts);
+  }
+  zIncr(
+    key: Uint8Array,
+    delta: number,
+    member: Uint8Array,
+    now: number,
+    opts?: ZAddOptions,
+  ): number | null {
+    return this.inner.zIncr(key, delta, member, now, opts);
+  }
+  zScore(key: Uint8Array, member: Uint8Array, now: number): number | null {
+    return this.inner.zScore(key, member, now);
+  }
+  zCard(key: Uint8Array, now: number): number {
+    return this.inner.zCard(key, now);
+  }
+  zRem(key: Uint8Array, members: Uint8Array[], now: number): number {
+    return this.inner.zRem(key, members, now);
+  }
+  zRank(key: Uint8Array, member: Uint8Array, now: number): number | null {
+    return this.inner.zRank(key, member, now);
+  }
+  zRangeByRank(
+    key: Uint8Array,
+    start: number,
+    stop: number,
+    rev: boolean,
+    now: number,
+  ): Array<[Uint8Array, number]> {
+    return this.inner.zRangeByRank(key, start, stop, rev, now);
+  }
+  zRangeByScore(
+    key: Uint8Array,
+    min: ScoreBound,
+    max: ScoreBound,
+    limit: { offset: number; count: number } | null,
+    now: number,
+  ): Array<[Uint8Array, number]> {
+    return this.inner.zRangeByScore(key, min, max, limit, now);
   }
 
   // ── internals ────────────────────────────────────────────────────────────-
