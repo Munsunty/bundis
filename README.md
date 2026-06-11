@@ -211,13 +211,16 @@ command arrives as the same RESP array. Coverage grows by adding dispatch cases.
 - **Hash:** HSET, HMSET, HSETNX, HGET, HMGET, HGETALL, HDEL, HEXISTS, HKEYS,
   HVALS, HLEN, HINCRBY, HINCRBYFLOAT
 - **Set:** SADD, SREM, SISMEMBER, SMEMBERS, SCARD, SRANDMEMBER, SPOP
+- **List:** LPUSH, RPUSH, LPOP, RPOP (with count), LRANGE, LLEN, LINDEX
+- **Sorted set:** ZADD, ZRANGE, ZREVRANGE, ZRANGEBYSCORE (with WITHSCORES/LIMIT),
+  ZSCORE, ZRANK, ZCARD, ZREM
 - **Pub/Sub:** SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH, PUBSUB
 - **Transactions:** MULTI, EXEC, DISCARD, WATCH, UNWATCH
 - **Server / admin:** TYPE, DBSIZE, FLUSHDB, FLUSHALL, CONFIG GET/SET, COMMAND
 
 `getBuffer()` is binary-safe (values are stored as BLOBs), `EXISTS`/`SISMEMBER`
-coerce to booleans, and pub/sub delivers RESP3 push frames — the response-type
-contract a stock client expects.
+coerce to booleans, zset scores reply as RESP3 doubles, and pub/sub delivers
+RESP3 push frames — the response-type contract a stock client expects.
 
 ## Not in scope
 
@@ -227,8 +230,7 @@ By design (see [`CLAUDE.md`](./CLAUDE.md), the design SSOT):
 - Redis Cluster / Sentinel (the client doesn't support them either).
 - Multi-process sharing of one `.db` file, HA, or automatic failover —
   single-writer is an enforced assumption.
-- Lua scripting (`EVAL`/`SCRIPT`), and the list/sorted-set command families
-  (planned, not yet implemented).
+- Lua scripting (`EVAL`/`SCRIPT`).
 
 ## Testing
 
@@ -239,7 +241,8 @@ bun run typecheck # tsc --noEmit, strict
 
 Contract tests boot the server on an ephemeral port and drive it with a genuine
 `Bun.RedisClient`, asserting on the **JS values it returns** — the only honest
-proof of wire compatibility.
+proof of wire compatibility. Set `REDIS_URL` to additionally run a differential
+test that replays the same commands against a real Redis and compares results.
 
 ## Project layout
 
