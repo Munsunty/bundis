@@ -175,9 +175,9 @@ keys        (key PK, type, expire_at_ms NULL)         -- 모든 키의 메타 + 
 kv          (key PK→keys, value BLOB)                  -- string (바이너리 안전)
 hash_fields (key, field, value BLOB, PK(key,field))    -- hash
 set_members (key, member, PK(key,member))              -- set
--- 확장 예약:
--- list_items (key, seq, value)        -- list (lpush/rpop)
--- zset_members(key, member, score)    -- zset, INDEX(key,score)
+list_items  (key, seq, value BLOB, PK(key,seq))        -- list; seq는 연속 정수 구간(양끝 push/pop 전용)
+zset_members(key, member, score, PK(key,member))       -- zset; + INDEX(key,score,member)
+                                                       --   동점 score는 member 사전순 → 순서 결정성
 ```
 - `value`는 BLOB — `getBuffer()`의 바이너리 안전성과 임의 바이트 보존을 위해 TEXT가 아닌 BLOB.
 - `keys`에서 타입 충돌 시 `WRONGTYPE` 에러(Redis 의미론).

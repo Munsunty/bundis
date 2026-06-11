@@ -42,4 +42,29 @@ describe("expiry", () => {
     await sleep(120); // give the reaper (20ms) time to sweep
     expect(await h.client.exists("k")).toBe(false);
   });
+
+  test("lazy expiry applies to list and zset keys", async () => {
+    await h.client.send("RPUSH", ["l", "a"]);
+    await h.client.send("ZADD", ["z", "1", "a"]);
+    expect(await h.client.expire("l", 100)).toBe(1);
+    expect(await h.client.ttl("z")).toBe(-1);
+    await h.client.send("PEXPIRE", ["l", "30"]);
+    await h.client.send("PEXPIRE", ["z", "30"]);
+    await sleep(60);
+    expect(await h.client.send("LRANGE", ["l", "0", "-1"])).toEqual([]);
+    expect(await h.client.send("LPOP", ["l"])).toBeNull();
+    expect(await h.client.send("ZSCORE", ["z", "a"])).toBeNull();
+    expect(await h.client.send("ZRANGE", ["z", "0", "-1"])).toEqual([]);
+  });
+
+  test("active expiry reaps untouched list and zset keys", async () => {
+    await h.client.send("RPUSH", ["l", "a"]);
+    await h.client.send("ZADD", ["z", "1", "a"]);
+    await h.client.send("PEXPIRE", ["l", "30"]);
+    await h.client.send("PEXPIRE", ["z", "30"]);
+    await sleep(120); // give the reaper (20ms) time to sweep
+    expect(await h.client.exists("l")).toBe(false);
+    expect(await h.client.exists("z")).toBe(false);
+    expect(await h.client.send("DBSIZE", [])).toBe(0);
+  });
 });

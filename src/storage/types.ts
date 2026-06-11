@@ -21,6 +21,23 @@ export interface SetOptions {
   readonly keepTtl?: boolean;
 }
 
+/** One endpoint of a score range. `value` may be ±Infinity (unbounded side). */
+export interface ScoreBound {
+  readonly value: number;
+  /** Exclude entries whose score equals `value`. */
+  readonly exclusive: boolean;
+}
+
+export interface ZAddOptions {
+  /** NX: only add new members. XX: only update existing members. */
+  readonly mode?: "NX" | "XX";
+  /** Only update an existing member when the new score is greater (GT) / less (LT). */
+  readonly gt?: boolean;
+  readonly lt?: boolean;
+  /** Count changed (not just added) members in the return value. */
+  readonly ch?: boolean;
+}
+
 export interface StorageEngine {
   // ── meta / ttl ────────────────────────────────────────────────────────────
   /** Stored type of a live key, or null if missing/expired. */
@@ -74,6 +91,58 @@ export interface StorageEngine {
   sRandMember(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null;
   /** Remove and return up to `count` random members. */
   sPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null;
+
+  // ── list ───────────────────────────────────────────────────────────────---
+  /** Prepend values (left-to-right, each becomes the new head); returns new length. */
+  lPush(key: Uint8Array, values: Uint8Array[], now: number): number;
+  /** Append values; returns new length. */
+  rPush(key: Uint8Array, values: Uint8Array[], now: number): number;
+  /** Remove and return head element(s); null when the key is missing. */
+  lPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null;
+  /** Remove and return tail element(s); null when the key is missing. */
+  rPop(key: Uint8Array, count: number | null, now: number): Uint8Array[] | Uint8Array | null;
+  /** Elements at ranks [start, stop]; negative indexes count from the tail. */
+  lRange(key: Uint8Array, start: number, stop: number, now: number): Uint8Array[];
+  lLen(key: Uint8Array, now: number): number;
+  lIndex(key: Uint8Array, index: number, now: number): Uint8Array | null;
+
+  // ── zset ───────────────────────────────────────────────────────────────---
+  /** Upsert score/member pairs; returns added count (+changed when opts.ch). */
+  zAdd(
+    key: Uint8Array,
+    entries: ReadonlyArray<readonly [number, Uint8Array]>,
+    now: number,
+    opts?: ZAddOptions,
+  ): number;
+  /** Add `delta` to a member's score; null when an NX/XX/GT/LT guard blocked it. */
+  zIncr(
+    key: Uint8Array,
+    delta: number,
+    member: Uint8Array,
+    now: number,
+    opts?: ZAddOptions,
+  ): number | null;
+  zScore(key: Uint8Array, member: Uint8Array, now: number): number | null;
+  zCard(key: Uint8Array, now: number): number;
+  zRem(key: Uint8Array, members: Uint8Array[], now: number): number;
+  /** 0-based ascending rank (ties break by member bytes), or null if absent. */
+  zRank(key: Uint8Array, member: Uint8Array, now: number): number | null;
+  /** [member, score] pairs at ranks [start, stop]; `rev` walks highest-first. */
+  zRangeByRank(
+    key: Uint8Array,
+    start: number,
+    stop: number,
+    rev: boolean,
+    now: number,
+  ): Array<[Uint8Array, number]>;
+  /** [member, score] pairs with min ≤ score ≤ max (bounds may be exclusive). */
+  zRangeByScore(
+    key: Uint8Array,
+    min: ScoreBound,
+    max: ScoreBound,
+    limit: { offset: number; count: number } | null,
+    now: number,
+  ): Array<[Uint8Array, number]>;
 
   // ── atomicity ─────────────────────────────────────────────────────────────
   /** Run `fn` inside a single SQLite transaction (single-writer assumption). */

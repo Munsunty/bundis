@@ -195,3 +195,70 @@ describe("HotCacheStorage", () => {
     expect(cache.typeOf(b("k"), 1003)).toBe("string");
   });
 });
+
+describe("HotCacheStorage list/zset coherence", () => {
+  /** Server wiring plus an onWrite spy, so write-path firing is observable. */
+  function makeSpied() {
+    let cache: HotCacheStorage | null = null;
+    const writes: string[] = [];
+    const inner = new SqliteStorage(":memory:", {
+      onWrite: (k) => {
+        writes.push(new TextDecoder().decode(k));
+        cache?.invalidate(k);
+      },
+    });
+    cache = new HotCacheStorage(inner, { maxBytes: 1024 * 1024, baseIdleMs: 1000 });
+    return { cache, inner, writes };
+  }
+
+  test("every list/zset write primitive fires onWrite, including empty-drop", () => {
+    const { cache, writes } = makeSpied();
+    cache.lPush(b("l"), [b("a")], 1000);
+    cache.rPush(b("l"), [b("b")], 1000);
+    cache.lPop(b("l"), null, 1000);
+    cache.rPop(b("l"), 1, 1000); // empties the list → key row dropped
+    cache.zAdd(b("z"), [[1, b("m")]], 1000);
+    cache.zIncr(b("z"), 1, b("m"), 1000);
+    cache.zRem(b("z"), [b("m")], 1000); // empties the zset → key row dropped
+    expect(writes).toEqual(["l", "l", "l", "l", "z", "z", "z"]);
+    expect(cache.exists(b("l"), 1001)).toBe(false);
+    expect(cache.exists(b("z"), 1001)).toBe(false);
+  });
+
+  test("a list write over an expired cached string invalidates the stale entry", () => {
+    const { cache } = makeSpied();
+    cache.kvSet(b("k"), b("v"), 1000); // write-through fill
+    expect(cache.kvGet(b("k"), 1001)).toEqual(b("v")); // cache hit
+    cache.expireSet(b("k"), 1500, 1001); // TTL in the near future
+    // After expiry, LPUSH lazily deletes the dead string row (onWrite →
+    // invalidate) and creates a fresh list under the same key.
+    expect(cache.lPush(b("k"), [b("x")], 2000)).toBe(1);
+    const invalidations = cache.stats().invalidations;
+    expect(invalidations).toBeGreaterThanOrEqual(1);
+    expect(cache.typeOf(b("k"), 2001)).toBe("list");
+    expect(cache.stats().entries).toBe(0); // no ghost string entry survives
+  });
+
+  test("read-only list/zset primitives delegate without touching the cache", () => {
+    const { cache, inner } = makeSpied();
+    inner.rPush(b("l"), [b("a"), b("b")], 1000);
+    inner.zAdd(b("z"), [[1, b("m")]], 1000);
+    expect(cache.lRange(b("l"), 0, -1, 1001)).toEqual([b("a"), b("b")]);
+    expect(cache.lLen(b("l"), 1001)).toBe(2);
+    expect(cache.lIndex(b("l"), -1, 1001)).toEqual(b("b"));
+    expect(cache.zScore(b("z"), b("m"), 1001)).toBe(1);
+    expect(cache.zCard(b("z"), 1001)).toBe(1);
+    expect(cache.zRank(b("z"), b("m"), 1001)).toBe(0);
+    expect(cache.zRangeByRank(b("z"), 0, -1, false, 1001)).toEqual([[b("m"), 1]]);
+    expect(
+      cache.zRangeByScore(
+        b("z"),
+        { value: -Infinity, exclusive: false },
+        { value: Infinity, exclusive: false },
+        null,
+        1001,
+      ),
+    ).toEqual([[b("m"), 1]]);
+    expect(cache.stats().entries).toBe(0);
+  });
+});
