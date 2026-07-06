@@ -93,7 +93,9 @@ export function startServer(config: ServerConfig): RunningServer {
       },
       data(socket: Socket<Connection>, chunk: Buffer) {
         const conn = socket.data;
-        conn.cork(); // batch all replies of this event into one socket write
+        // Cork: coalesce every reply from this batch into one socket.write.
+        conn.cork();
+        let fatal = false;
         try {
           const before = conn.parser.bufferedBytes;
           conn.parser.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
@@ -114,7 +116,6 @@ export function startServer(config: ServerConfig): RunningServer {
           } else {
             for (const command of commands) dispatch(conn, command, ctx, now);
           }
-          conn.uncork();
         } catch (err) {
           if (err instanceof ProtocolError) {
             conn.send(R.error("ERR", `Protocol error: ${err.message}`));
@@ -124,10 +125,12 @@ export function startServer(config: ServerConfig): RunningServer {
             console.error(`bundis: connection #${conn.id} error:`, err);
             conn.send(R.error("ERR", "internal error"));
           }
-          conn.uncork(); // flush the error reply before closing
           guard.sub(conn.parser.bufferedBytes); // releasing this connection's inbound bytes
-          socket.end();
+          fatal = true;
+        } finally {
+          conn.uncork(); // flush replies (incl. any error) in arrival order
         }
+        if (fatal) socket.end();
       },
       drain(socket: Socket<Connection>) {
         socket.data?.flush();

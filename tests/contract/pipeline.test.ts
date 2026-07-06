@@ -5,6 +5,10 @@ import { startHarness, closeHarness, type Harness } from "../helpers/server-harn
  * The stock client auto-pipelines concurrent commands. The server must process
  * them in arrival order and reply in the same order (§4.1.2), or Promise.all
  * results come back mismatched.
+ *
+ * These also guard the write-coalescing cork path: a whole batch's replies are
+ * merged into one socket.write, so a bug there would drop, duplicate, or
+ * reorder replies — which the ordered assertions below would catch.
  */
 
 let h: Harness;
@@ -45,5 +49,18 @@ describe("auto-pipelining", () => {
     expect(val).toBe("hello");
     expect(len).toBe(5);
     expect(card).toBe(2);
+  });
+
+  test("a large coalesced batch returns every reply, in order", async () => {
+    // A big pipeline forces many replies through one corked write. Each GET
+    // must come back with its own key's value and nothing be lost or shifted.
+    const N = 500;
+    await Promise.all(
+      Array.from({ length: N }, (_, i) => h.client.set(`b${i}`, `v${i}`)),
+    );
+    const got = await Promise.all(
+      Array.from({ length: N }, (_, i) => h.client.get(`b${i}`)),
+    );
+    expect(got).toEqual(Array.from({ length: N }, (_, i) => `v${i}`));
   });
 });

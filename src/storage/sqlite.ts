@@ -144,19 +144,36 @@ export class SqliteStorage implements StorageEngine {
   // ── meta / ttl ──────────────────────────────────────────────────────────--
 
   /**
-   * Resolve a key's live metadata, lazily expiring it first (§5.3.1).
-   * Returns null when the key is absent or just expired (and deletes it).
+   * Resolve a key's live metadata (§5.3.1). An expired key reads as absent but
+   * is NOT deleted here: physical removal is owned solely by the reaper
+   * ({@link sweepExpired}). Decoupling logical expiry from physical delete keeps
+   * the read path write-free, so a GET that lands on an expired key no longer
+   * contends with the writer lock (was a p99 spike under TTL churn).
    */
   #meta(key: Uint8Array, now: number): { type: RedisType; expireAtMs: number | null } | null {
     const row = this.#stmt(
       "SELECT type, expire_at_ms FROM keys WHERE key = ?",
     ).get(key) as { type: RedisType; expire_at_ms: number | null } | null;
     if (!row) return null;
-    if (row.expire_at_ms !== null && row.expire_at_ms <= now) {
-      this.#deleteKey(key);
-      return null;
-    }
+    if (row.expire_at_ms !== null && row.expire_at_ms <= now) return null;
     return { type: row.type, expireAtMs: row.expire_at_ms };
+  }
+
+  /**
+   * Write-path revive guard. Because {@link #meta} no longer deletes expired
+   * keys, a logically-expired row can still be physically present. Any mutator
+   * that may (re)create a key must purge that stale row first, or its
+   * `INSERT ... ON CONFLICT DO NOTHING` would keep the old type and resurrect
+   * orphaned child rows (WRONGTYPE / data leak). Deletes only when expired, so
+   * live keys pay just one indexed PK lookup.
+   */
+  #purgeExpired(key: Uint8Array, now: number): void {
+    const row = this.#stmt(
+      "SELECT expire_at_ms FROM keys WHERE key = ?",
+    ).get(key) as { expire_at_ms: number | null } | null;
+    if (row && row.expire_at_ms !== null && row.expire_at_ms <= now) {
+      this.#deleteKey(key);
+    }
   }
 
   /** Like {@link #meta} but throws TypeMismatchError if a live key isn't `want`. */
@@ -279,6 +296,7 @@ export class SqliteStorage implements StorageEngine {
     opts: SetOptions = {},
   ): "set" | "noop" {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       const meta = this.#meta(key, now);
       if (opts.mode === "NX" && meta !== null) return "noop";
       if (opts.mode === "XX" && meta === null) return "noop";
@@ -307,6 +325,7 @@ export class SqliteStorage implements StorageEngine {
 
   incrBy(key: Uint8Array, delta: bigint, now: number): bigint {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       const cur = this.kvGet(key, now);
       let n: bigint;
       if (cur === null) {
@@ -331,6 +350,7 @@ export class SqliteStorage implements StorageEngine {
 
   incrByFloat(key: Uint8Array, delta: number, now: number): number {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       const cur = this.kvGet(key, now);
       const n = cur === null ? 0 : parseFloatStrict(cur);
       const next = n + delta;
@@ -369,6 +389,7 @@ export class SqliteStorage implements StorageEngine {
     now: number,
   ): number {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       this.#expectType(key, "hash", now);
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'hash', NULL) " +
@@ -487,6 +508,7 @@ export class SqliteStorage implements StorageEngine {
 
   sAdd(key: Uint8Array, members: Uint8Array[], now: number): number {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       this.#expectType(key, "set", now);
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'set', NULL) " +
@@ -666,6 +688,7 @@ export class SqliteStorage implements StorageEngine {
 
   #push(key: Uint8Array, values: Uint8Array[], side: "L" | "R", now: number): number {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       this.#expectType(key, "list", now);
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'list', NULL) " +
@@ -774,6 +797,7 @@ export class SqliteStorage implements StorageEngine {
     opts: ZAddOptions = {},
   ): number {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       this.#expectType(key, "zset", now);
       const get = this.#stmt("SELECT score FROM zset_members WHERE key = ? AND member = ?");
       const ins = this.#stmt("INSERT INTO zset_members(key, member, score) VALUES (?, ?, ?)");
@@ -821,6 +845,7 @@ export class SqliteStorage implements StorageEngine {
     opts: ZAddOptions = {},
   ): number | null {
     return this.withTransaction(() => {
+      this.#purgeExpired(key, now);
       this.#expectType(key, "zset", now);
       const cur = this.#stmt(
         "SELECT score FROM zset_members WHERE key = ? AND member = ?",

@@ -52,6 +52,10 @@ export class Connection {
   #closed = false;
   readonly #guard: MemoryGuard;
 
+  /** When corked, replies accrue here and flush as one write on uncork. */
+  #corked = false;
+  #corkBuf: Uint8Array[] = [];
+
   constructor(
     readonly socket: Socket<Connection>,
     guard: MemoryGuard,
@@ -105,7 +109,31 @@ export class Connection {
 
   /** Serialize and write a reply, honoring backpressure. */
   send(reply: Reply): void {
-    this.write(serialize(reply));
+    const bytes = serialize(reply);
+    if (this.#corked) {
+      this.#corkBuf.push(bytes);
+      return;
+    }
+    this.write(bytes);
+  }
+
+  /**
+   * Begin batching replies. A whole pipeline of commands from one `data` event
+   * is processed under a cork so its replies coalesce into a single
+   * `socket.write` instead of one syscall per command (§4.1.2 ordering is
+   * preserved — bytes append in dispatch order).
+   */
+  cork(): void {
+    this.#corked = true;
+  }
+
+  /** Flush all batched replies as one ordered write and stop batching. */
+  uncork(): void {
+    this.#corked = false;
+    if (this.#corkBuf.length === 0) return;
+    const merged = this.#corkBuf.length === 1 ? this.#corkBuf[0]! : concat(this.#corkBuf);
+    this.#corkBuf.length = 0;
+    this.write(merged);
   }
 
   /** Write raw bytes, buffering any unflushed remainder for `drain`. */
@@ -168,5 +196,19 @@ export class Connection {
     this.#guard.sub(this.#outboxBytes);
     this.#outbox.length = 0;
     this.#outboxBytes = 0;
+    this.#corked = false;
+    this.#corkBuf.length = 0;
   }
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
 }

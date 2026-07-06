@@ -57,6 +57,18 @@ describe("expiry", () => {
     expect(await h.client.send("ZRANGE", ["z", "0", "-1"])).toEqual([]);
   });
 
+  test("recreating an expired key starts clean across a type change", async () => {
+    // #3: reads no longer physically delete, so a write that revives a
+    // logically-expired key must purge the stale row first. Here an expired
+    // hash is reused as a set — the old field must not bleed through.
+    await h.client.send("HSET", ["k", "f", "v"]);
+    await h.client.send("PEXPIRE", ["k", "30"]);
+    await sleep(60); // logically expired, row may still be physically present
+    expect(await h.client.send("SADD", ["k", "m"])).toBe(1);
+    expect(await h.client.type("k")).toBe("set");
+    expect(await h.client.send("SMEMBERS", ["k"])).toEqual(["m"]);
+  });
+
   test("active expiry reaps untouched list and zset keys", async () => {
     await h.client.send("RPUSH", ["l", "a"]);
     await h.client.send("ZADD", ["z", "1", "a"]);
