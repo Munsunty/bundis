@@ -22,6 +22,19 @@ import { ExpiryReaper } from "./sidecar/reaper";
 import type { ServerConfig } from "./config";
 import type { ServerContext } from "./engine/context";
 
+/** Commands that mutate storage (drive the group-commit batching decision). */
+const WRITE_COMMANDS = new Set([
+  "SET", "GETSET", "GETDEL", "APPEND", "DEL", "UNLINK",
+  "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
+  "MSET", "MSETNX", "SETEX", "PSETEX", "SETNX",
+  "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST",
+  "HSET", "HMSET", "HSETNX", "HDEL", "HINCRBY", "HINCRBYFLOAT",
+  "SADD", "SREM", "SPOP",
+  "LPUSH", "RPUSH", "LPOP", "RPOP",
+  "ZADD", "ZREM",
+  "FLUSHDB", "FLUSHALL",
+]);
+
 export interface RunningServer {
   /** Actual bound port (resolves `port: 0` used by tests). */
   readonly port: number;
@@ -80,6 +93,7 @@ export function startServer(config: ServerConfig): RunningServer {
       },
       data(socket: Socket<Connection>, chunk: Buffer) {
         const conn = socket.data;
+        conn.cork(); // batch all replies of this event into one socket write
         try {
           const before = conn.parser.bufferedBytes;
           conn.parser.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
@@ -88,9 +102,19 @@ export function startServer(config: ServerConfig): RunningServer {
           guard.add(conn.parser.bufferedBytes - before);
           if (guard.overLimit) throw new ProtocolError("server memory limit reached");
           const now = Date.now();
-          for (const command of commands) {
-            dispatch(conn, command, ctx, now);
+          let writes = 0;
+          for (const c of commands) if (WRITE_COMMANDS.has(c.name)) writes++;
+          if (writes > 1) {
+            // Group commit: one WAL commit for the whole pipelined batch.
+            // dispatch() never throws (errors become RESP replies), so the
+            // transaction always commits; replies flush after (uncork below).
+            sqlite.withTransaction(() => {
+              for (const command of commands) dispatch(conn, command, ctx, now);
+            });
+          } else {
+            for (const command of commands) dispatch(conn, command, ctx, now);
           }
+          conn.uncork();
         } catch (err) {
           if (err instanceof ProtocolError) {
             conn.send(R.error("ERR", `Protocol error: ${err.message}`));
@@ -100,6 +124,7 @@ export function startServer(config: ServerConfig): RunningServer {
             console.error(`bundis: connection #${conn.id} error:`, err);
             conn.send(R.error("ERR", "internal error"));
           }
+          conn.uncork(); // flush the error reply before closing
           guard.sub(conn.parser.bufferedBytes); // releasing this connection's inbound bytes
           socket.end();
         }
