@@ -5,10 +5,15 @@
  * state, selected DB, the streaming parser buffer, pub/sub subscriptions, the
  * MULTI transaction queue, and the WATCH snapshot. Also implements the
  * backpressure-aware {@link send} used by both the dispatcher and the PubSubHub.
+ *
+ * Replies serialize straight into a per-connection {@link RespWriter}. While
+ * corked (one `data` event's whole pipeline), bytes accrue there and flush as a
+ * single `socket.write` on uncork — §4.1.2 ordering is preserved because bytes
+ * append in dispatch order.
  */
 
 import type { Socket } from "bun";
-import { serialize } from "./resp/serializer";
+import { RespWriter } from "./resp/serializer";
 import { RespParser } from "./resp/parser";
 import type { Command, Reply } from "./resp/types";
 import type { WatchSnapshot } from "./sidecar/watch";
@@ -52,9 +57,10 @@ export class Connection {
   #closed = false;
   readonly #guard: MemoryGuard;
 
-  /** When corked, replies accrue here and flush as one write on uncork. */
+  /** Replies serialize here; flushed as one contiguous write per batch. */
+  readonly #writer = new RespWriter();
+  /** While corked, sends accrue in the writer instead of flushing per reply. */
   #corked = false;
-  #corkBuf: Uint8Array[] = [];
 
   constructor(
     readonly socket: Socket<Connection>,
@@ -73,55 +79,10 @@ export class Connection {
     return this.subscriptionCount() > 0;
   }
 
-  /** Replies buffered while corked (one data() event → one socket.write). */
-  #cork: Uint8Array[] | null = null;
-
-  /** Start buffering writes; {@link uncork} flushes them as one write. */
-  cork(): void {
-    if (this.#cork === null) this.#cork = [];
-  }
-
-  /** Flush all corked bytes with a single socket write. */
-  uncork(): void {
-    const parts = this.#cork;
-    this.#cork = null;
-    if (parts === null || parts.length === 0 || this.#closed) return;
-    if (parts.length === 1) {
-      this.#writeNow(parts[0]!);
-      return;
-    }
-    let total = 0;
-    for (const p of parts) total += p.length;
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const p of parts) {
-      out.set(p, offset);
-      offset += p.length;
-    }
-    this.#writeNow(out);
-  }
-
-  /** Flush any corked replies, then close the socket (QUIT path). */
-  end(): void {
-    this.uncork();
-    this.socket.end();
-  }
-
-  /** Serialize and write a reply, honoring backpressure. */
-  send(reply: Reply): void {
-    const bytes = serialize(reply);
-    if (this.#corked) {
-      this.#corkBuf.push(bytes);
-      return;
-    }
-    this.write(bytes);
-  }
-
   /**
    * Begin batching replies. A whole pipeline of commands from one `data` event
    * is processed under a cork so its replies coalesce into a single
-   * `socket.write` instead of one syscall per command (§4.1.2 ordering is
-   * preserved — bytes append in dispatch order).
+   * `socket.write` instead of one syscall per command.
    */
   cork(): void {
     this.#corked = true;
@@ -130,39 +91,47 @@ export class Connection {
   /** Flush all batched replies as one ordered write and stop batching. */
   uncork(): void {
     this.#corked = false;
-    if (this.#corkBuf.length === 0) return;
-    const merged = this.#corkBuf.length === 1 ? this.#corkBuf[0]! : concat(this.#corkBuf);
-    this.#corkBuf.length = 0;
-    this.write(merged);
+    this.#flush();
   }
 
-  /** Write raw bytes, buffering any unflushed remainder for `drain`. */
-  write(bytes: Uint8Array): void {
+  /** Flush any corked replies, then close the socket (QUIT path). */
+  end(): void {
+    this.uncork();
+    this.socket.end();
+  }
+
+  /** Serialize a reply into the shared writer, honoring cork + backpressure. */
+  send(reply: Reply): void {
     if (this.#closed) return;
-    if (this.#cork !== null) {
-      this.#cork.push(bytes);
-      return;
-    }
-    this.#writeNow(bytes);
+    this.#writer.writeReply(reply);
+    if (!this.#corked) this.#flush();
   }
 
+  #flush(): void {
+    if (this.#closed || this.#writer.length === 0) return;
+    this.#writeNow(this.#writer.take());
+  }
+
+  /**
+   * Write bytes now if possible. `bytes` may alias the shared writer buffer,
+   * so anything not consumed by `socket.write` is copied before queueing.
+   */
   #writeNow(bytes: Uint8Array): void {
-    if (this.#closed) return;
     if (this.#outbox.length > 0) {
       // Preserve ordering: once we're behind, everything queues.
-      this.#queue(bytes);
+      this.#queue(bytes.slice());
       return;
     }
     const written = this.socket.write(bytes);
     if (written < bytes.length) {
-      this.#queue(bytes.subarray(written));
+      this.#queue(bytes.slice(written));
     }
   }
 
   /**
-   * Queue backpressured bytes; a consumer that stops reading (e.g. a stalled
-   * subscriber under PUBLISH load) is disconnected at the cap rather than
-   * letting its outbox grow until the process OOMs.
+   * Queue backpressured bytes (an owned copy); a consumer that stops reading
+   * (e.g. a stalled subscriber under PUBLISH load) is disconnected at the cap
+   * rather than letting its outbox grow until the process OOMs.
    */
   #queue(bytes: Uint8Array): void {
     this.#outboxBytes += bytes.length;
@@ -192,23 +161,10 @@ export class Connection {
 
   markClosed(): void {
     this.#closed = true;
-    this.#cork = null;
+    this.#corked = false;
+    this.#writer.reset();
     this.#guard.sub(this.#outboxBytes);
     this.#outbox.length = 0;
     this.#outboxBytes = 0;
-    this.#corked = false;
-    this.#corkBuf.length = 0;
   }
-}
-
-function concat(parts: Uint8Array[]): Uint8Array {
-  let total = 0;
-  for (const p of parts) total += p.length;
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
-  return out;
 }

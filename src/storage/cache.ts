@@ -134,6 +134,12 @@ export class HotCacheStorage implements StorageEngine {
       return entry.value;
     }
     this.#misses++;
+    if (this.inner.kvGetEx) {
+      // Combined read: value + expiry in one inner lookup, no pttl read-back.
+      const res = this.inner.kvGetEx(key, now);
+      if (res !== null && !this.#inTxn) this.#fill(key, res.value, res.expireAtMs, now);
+      return res === null ? null : res.value;
+    }
     const value = this.inner.kvGet(key, now);
     if (value !== null && !this.#inTxn) {
       const exp = this.#expireOf(key, now);
@@ -147,10 +153,18 @@ export class HotCacheStorage implements StorageEngine {
     // onWrite already invalidated any stale entry; cache the committed value.
     // A "noop" (NX/XX guard) fires no onWrite, so the old entry stays valid.
     if (result === "set" && !this.#inTxn) {
-      // If the write carried an already-past expiry, the read-back's lazy
-      // expiry deletes the row and reports ABSENT — caching then would create
-      // an immortal ghost entry that SQLite no longer backs.
-      const exp = this.#expireOf(key, now);
+      // The committed expiry is known from the options for every case except
+      // KEEPTTL, so only that case pays a TTL read-back. A write that carried
+      // an already-past expiry is never cached — its row reads as expired in
+      // SQLite, and caching it would create an immortal ghost entry.
+      let exp: number | null | typeof ABSENT;
+      if (opts?.expireAtMs !== undefined && opts.expireAtMs !== null) {
+        exp = opts.expireAtMs > now ? opts.expireAtMs : ABSENT;
+      } else if (opts?.keepTtl) {
+        exp = this.#expireOf(key, now);
+      } else {
+        exp = null;
+      }
       if (exp !== ABSENT) this.#fill(key, value, exp, now);
     }
     return result;
@@ -441,7 +455,7 @@ export class HotCacheStorage implements StorageEngine {
   }
 }
 
-/** Binary-safe Map key for raw key bytes. */
+/** Binary-safe Map key for raw key bytes (zero-copy Buffer view). */
 function mapKey(key: Uint8Array): string {
-  return Buffer.from(key).toString("latin1");
+  return Buffer.from(key.buffer, key.byteOffset, key.byteLength).toString("latin1");
 }
