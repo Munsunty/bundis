@@ -243,7 +243,8 @@ function errReply(e: { code: string; message: string }): Reply {
   return R.error(e.code, e.message);
 }
 
+const DEC = new TextDecoder();
+
 function argStrings(command: Command): string[] {
-  const dec = new TextDecoder();
-  return command.args.slice(1).map((a) => dec.decode(a));
+  return command.args.slice(1).map((a) => DEC.decode(a));
 }

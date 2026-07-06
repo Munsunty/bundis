@@ -160,20 +160,35 @@ export class SqliteStorage implements StorageEngine {
   }
 
   /**
-   * Write-path revive guard. Because {@link #meta} no longer deletes expired
-   * keys, a logically-expired row can still be physically present. Any mutator
-   * that may (re)create a key must purge that stale row first, or its
-   * `INSERT ... ON CONFLICT DO NOTHING` would keep the old type and resurrect
-   * orphaned child rows (WRONGTYPE / data leak). Deletes only when expired, so
-   * live keys pay just one indexed PK lookup.
+   * Write-path revive guard + metadata read in one keys lookup. Because
+   * {@link #meta} no longer deletes expired keys, a logically-expired row can
+   * still be physically present. Any mutator that may (re)create a key must
+   * purge that stale row first, or its `INSERT ... ON CONFLICT DO NOTHING`
+   * would keep the old type and resurrect orphaned child rows (WRONGTYPE /
+   * data leak). Returns the live metadata (null if missing/just purged), so
+   * callers that also need the type/TTL don't pay a second keys lookup.
    */
-  #purgeExpired(key: Uint8Array, now: number): void {
+  #metaPurging(
+    key: Uint8Array,
+    now: number,
+  ): { type: RedisType; expireAtMs: number | null } | null {
     const row = this.#stmt(
-      "SELECT expire_at_ms FROM keys WHERE key = ?",
-    ).get(key) as { expire_at_ms: number | null } | null;
-    if (row && row.expire_at_ms !== null && row.expire_at_ms <= now) {
+      "SELECT type, expire_at_ms FROM keys WHERE key = ?",
+    ).get(key) as { type: RedisType; expire_at_ms: number | null } | null;
+    if (!row) return null;
+    if (row.expire_at_ms !== null && row.expire_at_ms <= now) {
       this.#deleteKey(key);
+      return null;
     }
+    return { type: row.type, expireAtMs: row.expire_at_ms };
+  }
+
+  /** {@link #metaPurging} + WRONGTYPE check: the standard mutator preamble. */
+  #expectTypePurging(key: Uint8Array, want: RedisType, now: number): boolean {
+    const meta = this.#metaPurging(key, now);
+    if (!meta) return false;
+    if (meta.type !== want) throw new TypeMismatchError(meta.type, want);
+    return true;
   }
 
   /** Like {@link #meta} but throws TypeMismatchError if a live key isn't `want`. */
@@ -188,13 +203,6 @@ export class SqliteStorage implements StorageEngine {
     // ON DELETE CASCADE removes child rows in kv/hash_fields/set_members.
     this.#stmt("DELETE FROM keys WHERE key = ?").run(key);
     this.#onWrite(key);
-  }
-
-  #ensureKey(key: Uint8Array, type: RedisType): void {
-    this.#stmt(
-      "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, ?, NULL) " +
-        "ON CONFLICT(key) DO NOTHING",
-    ).run(key, type);
   }
 
   typeOf(key: Uint8Array, now: number): RedisType | null {
@@ -282,11 +290,28 @@ export class SqliteStorage implements StorageEngine {
   // ── string / kv ─────────────────────────────────────────────────────────--
 
   kvGet(key: Uint8Array, now: number): Uint8Array | null {
-    if (!this.#expectType(key, "string", now)) return null;
-    const row = this.#stmt("SELECT value FROM kv WHERE key = ?").get(key) as
-      | { value: Uint8Array }
+    return this.kvGetEx(key, now)?.value ?? null;
+  }
+
+  /**
+   * Value + expiry in a single lookup: type check, lazy expiry, and the kv row
+   * all come from one keys⋈kv point query (was two statements per GET — the
+   * hottest read path). Also lets the hot cache fill without a pttl read-back.
+   */
+  kvGetEx(
+    key: Uint8Array,
+    now: number,
+  ): { value: Uint8Array; expireAtMs: number | null } | null {
+    const row = this.#stmt(
+      "SELECT k.type AS type, k.expire_at_ms AS expire_at_ms, v.value AS value " +
+        "FROM keys k LEFT JOIN kv v ON v.key = k.key WHERE k.key = ?",
+    ).get(key) as
+      | { type: RedisType; expire_at_ms: number | null; value: Uint8Array | null }
       | null;
-    return row ? row.value : null;
+    if (!row) return null;
+    if (row.expire_at_ms !== null && row.expire_at_ms <= now) return null;
+    if (row.type !== "string") throw new TypeMismatchError(row.type, "string");
+    return row.value === null ? null : { value: row.value, expireAtMs: row.expire_at_ms };
   }
 
   kvSet(
@@ -296,8 +321,7 @@ export class SqliteStorage implements StorageEngine {
     opts: SetOptions = {},
   ): "set" | "noop" {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
-      const meta = this.#meta(key, now);
+      const meta = this.#metaPurging(key, now);
       if (opts.mode === "NX" && meta !== null) return "noop";
       if (opts.mode === "XX" && meta === null) return "noop";
       if (meta !== null && meta.type !== "string") {
@@ -325,7 +349,7 @@ export class SqliteStorage implements StorageEngine {
 
   incrBy(key: Uint8Array, delta: bigint, now: number): bigint {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
+      this.#metaPurging(key, now);
       const cur = this.kvGet(key, now);
       let n: bigint;
       if (cur === null) {
@@ -350,7 +374,7 @@ export class SqliteStorage implements StorageEngine {
 
   incrByFloat(key: Uint8Array, delta: number, now: number): number {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
+      this.#metaPurging(key, now);
       const cur = this.kvGet(key, now);
       const n = cur === null ? 0 : parseFloatStrict(cur);
       const next = n + delta;
@@ -389,8 +413,7 @@ export class SqliteStorage implements StorageEngine {
     now: number,
   ): number {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
-      this.#expectType(key, "hash", now);
+      this.#expectTypePurging(key, "hash", now);
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'hash', NULL) " +
           "ON CONFLICT(key) DO NOTHING",
@@ -411,11 +434,19 @@ export class SqliteStorage implements StorageEngine {
   }
 
   hGet(key: Uint8Array, field: Uint8Array, now: number): Uint8Array | null {
-    if (!this.#expectType(key, "hash", now)) return null;
+    // Single keys⋈hash_fields point query: type check, lazy expiry, and the
+    // field lookup in one statement (was two).
     const row = this.#stmt(
-      "SELECT value FROM hash_fields WHERE key = ? AND field = ?",
-    ).get(key, field) as { value: Uint8Array } | null;
-    return row ? row.value : null;
+      "SELECT k.type AS type, k.expire_at_ms AS expire_at_ms, h.value AS value " +
+        "FROM keys k LEFT JOIN hash_fields h ON h.key = k.key AND h.field = ? " +
+        "WHERE k.key = ?",
+    ).get(field, key) as
+      | { type: RedisType; expire_at_ms: number | null; value: Uint8Array | null }
+      | null;
+    if (!row) return null;
+    if (row.expire_at_ms !== null && row.expire_at_ms <= now) return null;
+    if (row.type !== "hash") throw new TypeMismatchError(row.type, "hash");
+    return row.value;
   }
 
   hDel(key: Uint8Array, fields: Uint8Array[], now: number): number {
@@ -468,13 +499,17 @@ export class SqliteStorage implements StorageEngine {
   }
 
   hExists(key: Uint8Array, field: Uint8Array, now: number): boolean {
-    if (!this.#expectType(key, "hash", now)) return false;
-    return (
-      this.#stmt("SELECT 1 FROM hash_fields WHERE key = ? AND field = ?").get(
-        key,
-        field,
-      ) !== null
-    );
+    const row = this.#stmt(
+      "SELECT k.type AS type, k.expire_at_ms AS expire_at_ms, h.field AS hit " +
+        "FROM keys k LEFT JOIN hash_fields h ON h.key = k.key AND h.field = ? " +
+        "WHERE k.key = ?",
+    ).get(field, key) as
+      | { type: RedisType; expire_at_ms: number | null; hit: Uint8Array | null }
+      | null;
+    if (!row) return false;
+    if (row.expire_at_ms !== null && row.expire_at_ms <= now) return false;
+    if (row.type !== "hash") throw new TypeMismatchError(row.type, "hash");
+    return row.hit !== null;
   }
 
   hIncrBy(key: Uint8Array, field: Uint8Array, delta: bigint, now: number): bigint {
@@ -508,8 +543,7 @@ export class SqliteStorage implements StorageEngine {
 
   sAdd(key: Uint8Array, members: Uint8Array[], now: number): number {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
-      this.#expectType(key, "set", now);
+      this.#expectTypePurging(key, "set", now);
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'set', NULL) " +
           "ON CONFLICT(key) DO NOTHING",
@@ -540,13 +574,17 @@ export class SqliteStorage implements StorageEngine {
   }
 
   sIsMember(key: Uint8Array, member: Uint8Array, now: number): boolean {
-    if (!this.#expectType(key, "set", now)) return false;
-    return (
-      this.#stmt("SELECT 1 FROM set_members WHERE key = ? AND member = ?").get(
-        key,
-        member,
-      ) !== null
-    );
+    const row = this.#stmt(
+      "SELECT k.type AS type, k.expire_at_ms AS expire_at_ms, s.member AS hit " +
+        "FROM keys k LEFT JOIN set_members s ON s.key = k.key AND s.member = ? " +
+        "WHERE k.key = ?",
+    ).get(member, key) as
+      | { type: RedisType; expire_at_ms: number | null; hit: Uint8Array | null }
+      | null;
+    if (!row) return false;
+    if (row.expire_at_ms !== null && row.expire_at_ms <= now) return false;
+    if (row.type !== "set") throw new TypeMismatchError(row.type, "set");
+    return row.hit !== null;
   }
 
   sMembers(key: Uint8Array, now: number): Uint8Array[] {
@@ -688,8 +726,7 @@ export class SqliteStorage implements StorageEngine {
 
   #push(key: Uint8Array, values: Uint8Array[], side: "L" | "R", now: number): number {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
-      this.#expectType(key, "list", now);
+      this.#expectTypePurging(key, "list", now);
       this.#stmt(
         "INSERT INTO keys(key, type, expire_at_ms) VALUES (?, 'list', NULL) " +
           "ON CONFLICT(key) DO NOTHING",
@@ -797,8 +834,7 @@ export class SqliteStorage implements StorageEngine {
     opts: ZAddOptions = {},
   ): number {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
-      this.#expectType(key, "zset", now);
+      this.#expectTypePurging(key, "zset", now);
       const get = this.#stmt("SELECT score FROM zset_members WHERE key = ? AND member = ?");
       const ins = this.#stmt("INSERT INTO zset_members(key, member, score) VALUES (?, ?, ?)");
       const upd = this.#stmt(
@@ -845,8 +881,7 @@ export class SqliteStorage implements StorageEngine {
     opts: ZAddOptions = {},
   ): number | null {
     return this.withTransaction(() => {
-      this.#purgeExpired(key, now);
-      this.#expectType(key, "zset", now);
+      this.#expectTypePurging(key, "zset", now);
       const cur = this.#stmt(
         "SELECT score FROM zset_members WHERE key = ? AND member = ?",
       ).get(key, member) as { score: number } | null;
@@ -882,11 +917,23 @@ export class SqliteStorage implements StorageEngine {
   }
 
   zScore(key: Uint8Array, member: Uint8Array, now: number): number | null {
-    if (!this.#expectType(key, "zset", now)) return null;
+    const row = this.#zPoint(key, member, now);
+    return row === null ? null : row.score;
+  }
+
+  /** Single keys⋈zset_members point query shared by zScore/zRank. */
+  #zPoint(key: Uint8Array, member: Uint8Array, now: number): { score: number } | null {
     const row = this.#stmt(
-      "SELECT score FROM zset_members WHERE key = ? AND member = ?",
-    ).get(key, member) as { score: number } | null;
-    return row ? row.score : null;
+      "SELECT k.type AS type, k.expire_at_ms AS expire_at_ms, z.score AS score " +
+        "FROM keys k LEFT JOIN zset_members z ON z.key = k.key AND z.member = ? " +
+        "WHERE k.key = ?",
+    ).get(member, key) as
+      | { type: RedisType; expire_at_ms: number | null; score: number | null }
+      | null;
+    if (!row) return null;
+    if (row.expire_at_ms !== null && row.expire_at_ms <= now) return null;
+    if (row.type !== "zset") throw new TypeMismatchError(row.type, "zset");
+    return row.score === null ? null : { score: row.score };
   }
 
   zCard(key: Uint8Array, now: number): number {
@@ -910,10 +957,7 @@ export class SqliteStorage implements StorageEngine {
   }
 
   zRank(key: Uint8Array, member: Uint8Array, now: number): number | null {
-    if (!this.#expectType(key, "zset", now)) return null;
-    const cur = this.#stmt(
-      "SELECT score FROM zset_members WHERE key = ? AND member = ?",
-    ).get(key, member) as { score: number } | null;
+    const cur = this.#zPoint(key, member, now);
     if (cur === null) return null;
     // Count predecessors via an index range scan — O(rank), the best SQLite
     // offers without an auxiliary order-statistic structure.

@@ -29,32 +29,44 @@ const MAX_PENDING = 768 * 1024 * 1024;
 
 const EMPTY = new Uint8Array(0);
 
+/** Floor capacity for the owned accumulation buffer. */
+const MIN_CAP = 8 * 1024;
+
 export class RespParser {
-  /** Pending bytes not yet consumed into a full command. */
+  /** Pending bytes: either an aliased external chunk or an owned buffer. */
   #buf: Uint8Array = EMPTY;
+  /** Valid bytes in #buf (owned buffers over-allocate capacity). */
+  #len = 0;
   /** True while #buf aliases an externally-owned chunk (no copy taken yet). */
   #aliased = false;
 
   /** Bytes currently held pending a complete command. */
   get bufferedBytes(): number {
-    return this.#buf.length;
+    return this.#len;
   }
 
   /** Append a freshly received chunk to the internal buffer. */
   push(chunk: Uint8Array): void {
-    if (this.#buf.length + chunk.length > MAX_PENDING) {
+    if (this.#len + chunk.length > MAX_PENDING) {
       throw new ProtocolError("query buffer exceeds limit");
     }
-    if (this.#buf.length === 0) {
+    if (this.#len === 0) {
       this.#buf = chunk;
+      this.#len = chunk.length;
       this.#aliased = true; // zero-copy fast path; drain() copies any leftover
       return;
     }
-    const merged = new Uint8Array(this.#buf.length + chunk.length);
-    merged.set(this.#buf, 0);
-    merged.set(chunk, this.#buf.length);
-    this.#buf = merged;
-    this.#aliased = false;
+    if (this.#aliased || this.#len + chunk.length > this.#buf.length) {
+      // Grow geometrically so a value arriving in many chunks costs O(n)
+      // total copying, not O(n²) (one full-buffer copy per chunk).
+      const cap = Math.max(this.#buf.length * 2, this.#len + chunk.length, MIN_CAP);
+      const next = new Uint8Array(cap);
+      next.set(this.#buf.subarray(0, this.#len));
+      this.#buf = next;
+      this.#aliased = false;
+    }
+    this.#buf.set(chunk, this.#len);
+    this.#len += chunk.length;
   }
 
   /**
@@ -72,15 +84,23 @@ export class RespParser {
       out.push(res.command);
       offset = res.next;
     }
-    if (offset >= this.#buf.length) {
+    if (offset >= this.#len) {
+      // Fully consumed: release the buffer so the next push re-enters the
+      // zero-copy alias fast path (and a grown buffer doesn't stay pinned).
       this.#buf = EMPTY;
+      this.#len = 0;
       this.#aliased = false;
-    } else if (offset > 0 || this.#aliased) {
+    } else if (this.#aliased) {
       // Copy the remainder: the caller's chunk buffer may be reused by the
       // runtime after this callback returns, so we must never retain a view
       // of it across data() events.
-      this.#buf = this.#buf.slice(offset);
+      this.#buf = this.#buf.slice(offset, this.#len);
+      this.#len = this.#buf.length;
       this.#aliased = false;
+    } else if (offset > 0) {
+      // Owned buffer: slide the remainder to the front in place.
+      this.#buf.copyWithin(0, offset, this.#len);
+      this.#len -= offset;
     }
     return out;
   }
@@ -88,7 +108,7 @@ export class RespParser {
   /** Parse a single command starting at `start`, or null if incomplete. */
   #parseOne(start: number): { command: Command; next: number } | null {
     const buf = this.#buf;
-    if (start >= buf.length) return null;
+    if (start >= this.#len) return null;
     const first = buf[start]!;
     if (first === STAR) return this.#parseArray(start);
     // Inline command fallback: a CRLF- or LF-terminated whitespace-split line.
@@ -110,7 +130,7 @@ export class RespParser {
     const args: Uint8Array[] = [];
     let offset = header.next;
     for (let i = 0; i < count; i++) {
-      if (offset >= buf.length) return null;
+      if (offset >= this.#len) return null;
       if (buf[offset] !== DOLLAR) throw new ProtocolError("expected bulk string");
       const lenLine = this.#readLine(offset);
       if (lenLine === null) return null;
@@ -120,7 +140,7 @@ export class RespParser {
       }
       const dataStart = lenLine.next;
       const dataEnd = dataStart + len;
-      if (dataEnd + 2 > buf.length) return null; // data + trailing CRLF not all here yet
+      if (dataEnd + 2 > this.#len) return null; // data + trailing CRLF not all here yet
       args.push(buf.slice(dataStart, dataEnd)); // copy: detach from the shared buffer
       offset = dataEnd + 2; // skip trailing CRLF
     }
@@ -131,7 +151,7 @@ export class RespParser {
   #parseInline(start: number): { command: Command; next: number } | null {
     const line = this.#readLine(start);
     if (line === null) {
-      if (this.#buf.length - start > MAX_INLINE_LEN) {
+      if (this.#len - start > MAX_INLINE_LEN) {
         throw new ProtocolError("too big inline request");
       }
       return null;
@@ -143,7 +163,7 @@ export class RespParser {
       return { command: { name: "", args: [] }, next: line.next };
     }
     const tokens = text.split(/\s+/);
-    const args = tokens.map((t) => new TextEncoder().encode(t));
+    const args = tokens.map((t) => ENC.encode(t));
     return { command: { name: tokens[0]!.toUpperCase(), args }, next: line.next };
   }
 
@@ -154,7 +174,8 @@ export class RespParser {
    */
   #readLine(from: number): { end: number; next: number } | null {
     const buf = this.#buf;
-    for (let i = from; i < buf.length; i++) {
+    const len = this.#len;
+    for (let i = from; i < len; i++) {
       if (buf[i] === LF) {
         const end = i > from && buf[i - 1] === CR ? i - 1 : i;
         return { end, next: i + 1 };
@@ -165,6 +186,8 @@ export class RespParser {
 }
 
 export class ProtocolError extends Error {}
+
+const ENC = new TextEncoder();
 
 function decodeAscii(bytes: Uint8Array): string {
   let s = "";

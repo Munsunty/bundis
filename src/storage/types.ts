@@ -60,6 +60,15 @@ export interface StorageEngine {
 
   // ── string / kv ─────────────────────────────────────────────────────────--
   kvGet(key: Uint8Array, now: number): Uint8Array | null;
+  /**
+   * Optional combined read: value + absolute expiry in one lookup. Lets a
+   * caching layer fill on a miss without a second TTL query. Same semantics as
+   * {@link kvGet} (lazy expiry, WRONGTYPE throw); null when missing/expired.
+   */
+  kvGetEx?(
+    key: Uint8Array,
+    now: number,
+  ): { value: Uint8Array; expireAtMs: number | null } | null;
   /** Returns the value actually stored, or null when an NX/XX guard blocked it. */
   kvSet(key: Uint8Array, value: Uint8Array, now: number, opts?: SetOptions): "set" | "noop";
   /** Atomic add of `delta`; returns new value. Throws notInt on non-integer. */
