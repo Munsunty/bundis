@@ -24,6 +24,7 @@ import type {
 } from "./types";
 
 const ENC = new TextEncoder();
+const DEC = new TextDecoder();
 
 /** Max expired keys reclaimed per sweep call (bounds reaper-tick stalls). */
 const SWEEP_BATCH = 1000;
@@ -638,13 +639,21 @@ export class SqliteStorage implements StorageEngine {
   // BETWEEN index-range scan — no OFFSET. Adding LREM/LINSERT/LSET later
   // breaks this invariant and requires renumbering (or a different scheme).
 
-  /** Live seq interval of a list key, or null when it has no rows. */
+  /**
+   * Live seq interval of a list key, or null when it has no rows.
+   * Two single-aggregate queries: SQLite's min/max optimization turns each
+   * into one index seek, but a combined MIN+MAX query falls back to a full
+   * scan of the key's rows (measured 7ms on a 100k list).
+   */
   #listBounds(key: Uint8Array): { min: number; max: number } | null {
-    const row = this.#stmt(
-      "SELECT MIN(seq) AS mn, MAX(seq) AS mx FROM list_items WHERE key = ?",
-    ).get(key) as { mn: number | null; mx: number | null };
-    if (row.mn === null) return null;
-    return { min: row.mn, max: row.mx! };
+    const mn = this.#stmt(
+      "SELECT MIN(seq) AS v FROM list_items WHERE key = ?",
+    ).get(key) as { v: number | null };
+    if (mn.v === null) return null;
+    const mx = this.#stmt(
+      "SELECT MAX(seq) AS v FROM list_items WHERE key = ?",
+    ).get(key) as { v: number | null };
+    return { min: mn.v, max: mx.v! };
   }
 
   lPush(key: Uint8Array, values: Uint8Array[], now: number): number {
@@ -733,10 +742,9 @@ export class SqliteStorage implements StorageEngine {
 
   lLen(key: Uint8Array, now: number): number {
     if (!this.#expectType(key, "list", now)) return 0;
-    const row = this.#stmt(
-      "SELECT COUNT(*) AS n FROM list_items WHERE key = ?",
-    ).get(key) as { n: number };
-    return row.n;
+    // Contiguous-seq invariant: length = max - min + 1, two index seeks.
+    const bounds = this.#listBounds(key);
+    return bounds ? bounds.max - bounds.min + 1 : 0;
   }
 
   lIndex(key: Uint8Array, index: number, now: number): Uint8Array | null {
@@ -898,9 +906,18 @@ export class SqliteStorage implements StorageEngine {
     now: number,
   ): Array<[Uint8Array, number]> {
     if (!this.#expectType(key, "zset", now)) return [];
-    const len = this.zCard(key, now);
-    const s = Math.max(0, start < 0 ? len + start : start);
-    const e = Math.min(len - 1, stop < 0 ? len + stop : stop);
+    let s: number;
+    let e: number;
+    if (start >= 0 && stop >= 0) {
+      // Non-negative ranges never need the cardinality: LIMIT past the end
+      // just returns fewer rows. Skipping zCard avoids an O(n) COUNT scan.
+      s = start;
+      e = stop;
+    } else {
+      const len = this.zCard(key, now);
+      s = Math.max(0, start < 0 ? len + start : start);
+      e = Math.min(len - 1, stop < 0 ? len + stop : stop);
+    }
     if (s > e) return [];
     // LIMIT/OFFSET here skips entries inside the (key, score, member) index
     // run — same O(start + n) class as the ZRANK count-scan, no row
@@ -979,7 +996,7 @@ export class SqliteStorage implements StorageEngine {
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 function parseIntStrict(bytes: Uint8Array): bigint {
-  const s = new TextDecoder().decode(bytes).trim();
+  const s = DEC.decode(bytes).trim();
   if (!/^[+-]?\d+$/.test(s)) {
     throw new NotIntegerError();
   }
@@ -987,7 +1004,7 @@ function parseIntStrict(bytes: Uint8Array): bigint {
 }
 
 function parseFloatStrict(bytes: Uint8Array): number {
-  const s = new TextDecoder().decode(bytes).trim();
+  const s = DEC.decode(bytes).trim();
   if (s.length === 0) throw new NotFloatError();
   const lower = s.toLowerCase();
   if (lower === "inf" || lower === "+inf") return Infinity;

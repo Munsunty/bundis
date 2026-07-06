@@ -75,7 +75,7 @@ export function echo(ctx: CommandContext): Reply {
 
 export function quit(ctx: CommandContext): null {
   ctx.conn.send(R.ok());
-  ctx.conn.socket.end();
+  ctx.conn.end(); // flushes any corked replies before closing
   return null; // reply already written; socket is closing
 }
 

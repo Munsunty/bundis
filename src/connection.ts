@@ -69,6 +69,40 @@ export class Connection {
     return this.subscriptionCount() > 0;
   }
 
+  /** Replies buffered while corked (one data() event → one socket.write). */
+  #cork: Uint8Array[] | null = null;
+
+  /** Start buffering writes; {@link uncork} flushes them as one write. */
+  cork(): void {
+    if (this.#cork === null) this.#cork = [];
+  }
+
+  /** Flush all corked bytes with a single socket write. */
+  uncork(): void {
+    const parts = this.#cork;
+    this.#cork = null;
+    if (parts === null || parts.length === 0 || this.#closed) return;
+    if (parts.length === 1) {
+      this.#writeNow(parts[0]!);
+      return;
+    }
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.length;
+    }
+    this.#writeNow(out);
+  }
+
+  /** Flush any corked replies, then close the socket (QUIT path). */
+  end(): void {
+    this.uncork();
+    this.socket.end();
+  }
+
   /** Serialize and write a reply, honoring backpressure. */
   send(reply: Reply): void {
     this.write(serialize(reply));
@@ -76,6 +110,15 @@ export class Connection {
 
   /** Write raw bytes, buffering any unflushed remainder for `drain`. */
   write(bytes: Uint8Array): void {
+    if (this.#closed) return;
+    if (this.#cork !== null) {
+      this.#cork.push(bytes);
+      return;
+    }
+    this.#writeNow(bytes);
+  }
+
+  #writeNow(bytes: Uint8Array): void {
     if (this.#closed) return;
     if (this.#outbox.length > 0) {
       // Preserve ordering: once we're behind, everything queues.
@@ -121,6 +164,7 @@ export class Connection {
 
   markClosed(): void {
     this.#closed = true;
+    this.#cork = null;
     this.#guard.sub(this.#outboxBytes);
     this.#outbox.length = 0;
     this.#outboxBytes = 0;
