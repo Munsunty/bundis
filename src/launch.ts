@@ -13,6 +13,7 @@
 
 import { startServer, type RunningServer } from "./server";
 import type { ServerConfig } from "./config";
+import { existsSync } from "node:fs";
 
 /** stdout JSON `event` value the CLI prints once it is accepting connections. */
 export const READY_EVENT = "bundis:ready";
@@ -38,11 +39,11 @@ export interface LaunchOptions {
   /** Hot-cache base time-to-idle in seconds (default 300). */
   cacheIdleSec?: number;
   /**
-   * "worker" runs data cleanup (expired/deleted rows, disk reclaim) on a
-   * background thread while writes buffer in memory (default "off").
-   * Requires a file database.
+   * Background data cleanup (expired/deleted rows, disk reclaim) on a worker
+   * thread while writes buffer in memory. "auto" (default): on for file
+   * databases, off for ":memory:". "off" disables it.
    */
-  maintenance?: "off" | "worker";
+  maintenance?: "auto" | "off" | "worker";
   /**
    * Initial maintenance parameters by CONFIG name, e.g.
    * `{ "maint-interval-sec": 30 }`. Adjustable later with CONFIG SET.
@@ -91,12 +92,27 @@ export interface SpawnServerOptions extends LaunchOptions {
   bunPath?: string;
   /** Max ms to wait for the child's ready signal (default 10_000). */
   readyTimeoutMs?: number;
+  /**
+   * Path to bundis's `cli.ts` for the child process (default: next to this
+   * module). Needed when the app is bundled (`bun build`): the bundle no
+   * longer has bundis's source files beside it, so point this at an
+   * installed copy, e.g. `node_modules/bundis/src/cli.ts`.
+   */
+  cliPath?: string;
 }
 
 /** Start the server as a separate Bun process (sidecar mode). */
 export async function spawnServer(opts: SpawnServerOptions = {}): Promise<SpawnedServer> {
   const config = resolveConfig(opts);
-  const cliPath = Bun.fileURLToPath(new URL("./cli.ts", import.meta.url));
+  const cliPath = opts.cliPath ?? Bun.fileURLToPath(new URL("./cli.ts", import.meta.url));
+  if (!existsSync(cliPath)) {
+    // The child runs bundis's CLI from source. A bundled app does not ship it,
+    // so fail with the cause instead of a child that exits before ready.
+    throw new Error(
+      `spawnServer: bundis CLI not found at ${cliPath}. In a bundled build, pass ` +
+        "`cliPath` (e.g. node_modules/bundis/src/cli.ts), or use embedServer().",
+    );
+  }
   // The password travels via environment, never argv — argv is visible to
   // every local user in `ps` for the lifetime of the child.
   const env: Record<string, string | undefined> = { ...process.env };
@@ -113,7 +129,7 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Spawne
       "--max-memory-mb", String(Math.floor(config.maxMemoryBytes / (1024 * 1024))),
       "--cache-mb", String(Math.floor(config.cacheMaxBytes / (1024 * 1024))),
       "--cache-idle", String(Math.floor(config.cacheIdleMs / 1000)),
-      "--maintenance", config.maintenance ?? "off",
+      "--maintenance", config.maintenance ?? "auto",
       ...Object.entries(config.maintParams ?? {}).flatMap(([k, v]) => [`--${k}`, v]),
     ],
     { stdout: "pipe", stderr: "inherit", env },
@@ -157,7 +173,7 @@ function resolveConfig(opts: LaunchOptions): ServerConfig {
     maxMemoryBytes: maxMemoryMb * MB,
     cacheMaxBytes: (opts.cacheMb ?? Math.floor(maxMemoryMb / 4)) * MB,
     cacheIdleMs: (opts.cacheIdleSec ?? 300) * 1000,
-    maintenance: opts.maintenance ?? "off",
+    maintenance: opts.maintenance ?? "auto",
     maintParams: Object.fromEntries(
       Object.entries(opts.maint ?? {}).map(([k, v]) => [
         k,

@@ -50,12 +50,13 @@ export interface RunningServer {
 export function startServer(config: ServerConfig): RunningServer {
   const watch = new WatchRegistry();
   const fileDb = config.dbPath !== ":memory:" && config.dbPath !== "";
-  if (config.maintenance === "worker" && !fileDb) {
+  const mode = config.maintenance ?? "auto";
+  if (mode === "worker" && !fileDb) {
     // The worker needs its own connection to the same file; an in-memory
-    // database is private to one connection.
+    // database is private to one connection. ("auto" falls back silently.)
     console.error("bundis: --maintenance worker needs a file database; maintenance disabled");
   }
-  const workerMode = config.maintenance === "worker" && fileDb;
+  const workerMode = mode !== "off" && fileDb;
   // Single-writer contract: worker mode cannot use EXCLUSIVE locking (it needs
   // a second connection), so it holds a lock file; exclusive mode refuses to
   // open a file that a live worker-mode server holds.

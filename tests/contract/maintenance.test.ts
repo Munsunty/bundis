@@ -305,3 +305,90 @@ describe("maintenance: lazy FLUSHALL", () => {
     expect(await c.send("DBSIZE", [])).toBe(1);
   });
 });
+
+describe("maintenance: default mode (auto)", () => {
+  test("embedServer with a file database runs worker maintenance by default", async () => {
+    const { embedServer } = await import("../../src/launch");
+    const path = mkTempDbPath();
+    const server = embedServer({ port: 0, dbPath: path });
+    const c = new RedisClient(server.url);
+    try {
+      expect(existsSync(lockPath(path))).toBe(true);
+      const st = (await c.send("MAINT", ["STATUS"])) as Status;
+      expect(st.maint_mode).toBe("worker");
+      expect(st.disk_auto_vacuum).toBe("incremental");
+    } finally {
+      c.close();
+      server.stop();
+      cleanupDb(path);
+    }
+    expect(existsSync(lockPath(path))).toBe(false);
+  });
+
+  test("an in-memory database silently falls back to maintenance off", async () => {
+    const { embedServer } = await import("../../src/launch");
+    const errors: unknown[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => void errors.push(a);
+    const server = embedServer({ port: 0, dbPath: ":memory:" });
+    console.error = orig;
+    const c = new RedisClient(server.url);
+    try {
+      expect(server.server.server.maintenance).toBeNull();
+      await expect(c.send("MAINT", ["STATUS"])).rejects.toThrow(/maintenance is off/);
+      expect(errors.filter((e) => String(e).includes("maintenance"))).toEqual([]);
+    } finally {
+      c.close();
+      server.stop();
+    }
+  });
+
+  test("maintenance: off opts out for a file database", async () => {
+    const { embedServer } = await import("../../src/launch");
+    const path = mkTempDbPath();
+    const server = embedServer({ port: 0, dbPath: path, maintenance: "off" });
+    try {
+      expect(server.server.server.maintenance).toBeNull();
+      expect(existsSync(lockPath(path))).toBe(false);
+    } finally {
+      server.stop();
+      cleanupDb(path);
+    }
+  });
+});
+
+describe("maintenance: worker failure", () => {
+  test("a worker that fails to start never strands writes in the buffer", async () => {
+    const RealWorker = globalThis.Worker;
+    // Every Worker this server creates fails to load.
+    globalThis.Worker = class extends RealWorker {
+      constructor() {
+        super(URL.createObjectURL(new Blob(["this is not javascript ("], { type: "text/javascript" })));
+      }
+    } as typeof Worker;
+    const orig = console.error;
+    console.error = () => {};
+    let h: Harness;
+    try {
+      h = await workerServer({ "maint-expired-threshold": "1" });
+      for (let i = 0; i < 100 && (await status(h.client)).maint_worker !== "failed"; i++) await Bun.sleep(10);
+    } finally {
+      globalThis.Worker = RealWorker;
+      console.error = orig;
+    }
+    const c = h.client;
+    const st = await status(c);
+    expect(st.maint_worker).toBe("failed");
+    expect(String(st.maint_last_error)).toContain("worker");
+    await expect(c.send("MAINT", ["RUN"])).rejects.toThrow(/worker failed/);
+    // Triggers stay quiet: writes go straight to SQLite, nothing buffers.
+    await c.send("SET", ["t", "v", "PX", "1"]);
+    await c.set("k", "v");
+    await Bun.sleep(1_200); // past a trigger tick with the backlog over threshold
+    const after = await status(c);
+    expect(after.maint_state).toBe("normal");
+    expect(after.maint_cycles).toBe(0);
+    expect(after.maint_buffer_entries).toBe(0);
+    expect(await c.get("k")).toBe("v");
+  });
+});
