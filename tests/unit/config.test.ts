@@ -27,3 +27,20 @@ describe("memory configuration", () => {
     expect(c.cacheMaxBytes).toBe(0);
   });
 });
+
+describe("maintenance configuration", () => {
+  test("defaults to auto; accepts auto/off/worker; rejects anything else", () => {
+    const prev = Bun.env.REDIS_MAINTENANCE;
+    delete Bun.env.REDIS_MAINTENANCE;
+    try {
+      expect(loadConfig([]).maintenance).toBe("auto");
+      expect(loadConfig(["--maintenance", "off"]).maintenance).toBe("off");
+      expect(loadConfig(["--maintenance", "worker"]).maintenance).toBe("worker");
+      expect(loadConfig(["--maintenance", "auto"]).maintenance).toBe("auto");
+      expect(() => loadConfig(["--maintenance", "on"])).toThrow(/auto/);
+      expect(loadConfig(["--maint-interval-sec", "30"]).maintParams).toEqual({ "maint-interval-sec": "30" });
+    } finally {
+      if (prev !== undefined) Bun.env.REDIS_MAINTENANCE = prev;
+    }
+  });
+});

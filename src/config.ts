@@ -10,8 +10,9 @@
  *       50% SQLite page cache, 25% hot cache unless --cache-mb given)
  *   --cache-mb / REDIS_CACHE_MB  (default: maxMemory/4; 0 disables hot cache)
  *   --cache-idle / REDIS_CACHE_IDLE_SEC (default 300 — hot-cache base TTI)
- *   --maintenance / REDIS_MAINTENANCE (default off; "worker" = background
- *       maintenance thread, see sidecar/maintenance.ts — file-backed DBs only)
+ *   --maintenance / REDIS_MAINTENANCE (default auto: background maintenance
+ *       thread for file databases, off for ":memory:"; "worker" forces it on,
+ *       "off" disables it — see sidecar/maintenance.ts)
  *   --maint-<name> <value>        initial value of a runtime maintenance
  *       parameter (same names as CONFIG SET maint-*)
  */
@@ -35,13 +36,16 @@ export interface ServerConfig {
   cacheMaxBytes: number;
   /** Hot-cache base time-to-idle in ms. */
   cacheIdleMs: number;
-  /** "worker": background maintenance thread + write buffer (file DBs only). */
+  /**
+   * Background maintenance thread + write buffer. "auto" (default): on for
+   * file databases, off for ":memory:". "worker": on (warns on ":memory:").
+   */
   maintenance?: MaintenanceMode;
   /** Initial maintenance parameters by CONFIG name (e.g. "maint-interval-sec"). */
   maintParams?: Record<string, string>;
 }
 
-export type MaintenanceMode = "off" | "worker";
+export type MaintenanceMode = "auto" | "off" | "worker";
 
 export function loadConfig(argv: string[] = Bun.argv.slice(2)): ServerConfig {
   const flags = parseFlags(argv);
@@ -71,9 +75,9 @@ export function loadConfig(argv: string[] = Bun.argv.slice(2)): ServerConfig {
 }
 
 function maintenanceMode(v: string | undefined): MaintenanceMode {
-  if (v === undefined || v === "" || v === "off") return "off";
-  if (v === "worker") return "worker";
-  throw new Error(`invalid --maintenance value "${v}" (expected "off" or "worker")`);
+  if (v === undefined || v === "" || v === "auto") return "auto";
+  if (v === "off" || v === "worker") return v;
+  throw new Error(`invalid --maintenance value "${v}" (expected "auto", "off" or "worker")`);
 }
 
 function parseFlags(argv: string[]): Record<string, string> {

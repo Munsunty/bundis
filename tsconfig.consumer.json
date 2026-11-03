@@ -1,0 +1,9 @@
+{
+  // Typecheck bundis's sources the way an application does: bundis ships TS
+  // source, so a consumer's tsc checks it under the consumer's settings
+  // (skipLibCheck covers .d.ts only). Default libs include DOM, whose types
+  // (e.g. Worker without unref) differ from Bun's.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "lib": ["ESNext", "DOM", "DOM.Iterable"] },
+  "include": ["src/**/*.ts"]
+}

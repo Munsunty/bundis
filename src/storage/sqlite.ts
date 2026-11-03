@@ -1227,8 +1227,14 @@ export class SqliteStorage implements StorageEngine {
       s = this.#db.query(sql);
       this.#stmtCache.set(sql, s);
     }
-    // `readonly` is undefined before Bun 1.4.4 → `=== false` skips the check.
-    if (this.#writeGuard !== null && s.readonly === false && this.#writeGuard()) {
+    // `Statement.readonly` exists from Bun 1.4.4 (undefined before → `=== false`
+    // skips the check). Read structurally: a consumer typechecking bundis's
+    // sources against older bun-types must still compile.
+    if (
+      this.#writeGuard !== null &&
+      (s as { readonly readonly?: boolean }).readonly === false &&
+      this.#writeGuard()
+    ) {
       throw new WriteGuardError(sql);
     }
     return s;

@@ -190,14 +190,20 @@ Redis 체감과 맞추려면 **두 경로 모두** 구현:
 
 `bun:sqlite`는 동기 API라 단일 프로세스 내 원자성 추론이 단순하다. **단일 writer 가정**을 계약에 명시(여러 서버 프로세스가 같은 .db 파일을 공유하지 않는다).
 
-### 5.4 백그라운드 유지보수 (worker 모드, `--maintenance worker`)
+### 5.4 백그라운드 유지보수 (worker 모드, 기본값 `--maintenance auto`)
 삭제는 SQLite에서 동기이고 서버는 단일 스레드라, 큰 키 삭제가 모든 연결을 멈춘다. worker 모드는 이를 이벤트 루프 밖으로 뺀다.
+- **기본값 `auto`**: 파일 DB면 켜지고, `:memory:`면 조용히 꺼진다(worker가 같은 DB에 두 번째 연결을 열 수 없음). `off`로 끌 수 있고, `worker`는 강제로 켠다(`:memory:`면 경고).
 - **논리/물리 삭제 분리**: 비-string 키의 `DEL`/`UNLINK`와 `FLUSHALL`은 `expire_at_ms = 0` 표시(tombstone)만 한다. 클라이언트에게는 즉시 없는 키다.
 - **사이클**: NORMAL → (축출 표시) → IDLE → FLUSHING → NORMAL. IDLE 동안 별도 스레드(`sidecar/maint-worker.ts`)가 자기 연결로 만료/tombstone 키를 chunk 단위로 지우고, `incremental_vacuum`과 WAL checkpoint를 한다.
 - **IDLE 쓰기 버퍼**: IDLE 동안 메인 스레드는 SQLite에 쓰지 않는다(`storage/overlay.ts`). 쓰기는 키 단위 버퍼(tombstone / 전체 교체 / 필드·멤버·리스트 끝 연산 delta + TTL override)에 쌓이고, 읽기는 "버퍼 우선, 없으면 SQLite"로 합친다(WAL이라 동시 읽기 가능). worker가 끝나면 버퍼를 시간 예산 단위로 SQLite에 반영한다. IDLE 중 건드리지 않은 cold 키는 SQLite에 그대로 있고, hot cache는 write-through라 되내릴 것이 없다.
 - **경계 조건**: worker는 사이클 시작 전 cutoff 이하로 만료된 키만 지운다. 이런 키는 오버레이에서도 이미 없는 키라 버퍼가 그 행에 의존하지 않는다. 다음 사이클은 버퍼가 빈 뒤에만 시작한다.
 - **런타임 조절**: 모든 파라미터는 `CONFIG SET maint-*`로 바꾸고 `CONFIG GET` / `INFO`(# Maintenance) / `MAINT STATUS`로 본다. `MAINT RUN`은 즉시 사이클을 시작한다.
 - **불변식의 런타임 강제**: "IDLE 중 메인 연결은 쓰지 않는다"를 `Statement.readonly`(sqlite3_stmt_readonly, Bun ≥ 1.4.4)로 검사한다. 오버레이가 버퍼링 중이고 반영 중이 아닐 때 쓰기 문장이 `#stmt()`를 지나면 `WriteGuardError`를 던진다(조용한 정합성 손상 대신 명시적 `ERR`). 1.4.4 미만에서는 검사를 건너뛴다. 모든 데이터 SQL은 `#stmt()`를 지나야 한다.
+- **배포 형태(번들) 계약**: bundis는 TS 소스로 배포되어 소비자의 번들러·tsc를 그대로 통과한다. 따라서
+  (1) worker는 파일 경로가 아니라 `runJob.toString()`으로 만든 Blob URL에서 띄운다. `runJob`은 자기 완결적이어야 한다(모듈 바깥 값·import 참조 금지, `Database`는 인자로 받음).
+  (2) Bun 버전별 API(`Statement.readonly`, `Worker.unref` 등)는 구조적 캐스트로 읽어, 오래된 `@types/bun`이나 DOM lib에서도 컴파일되게 한다(`tsconfig.consumer.json`).
+  (3) worker가 준비(ready)를 알리기 전이나 실패한 뒤에는 사이클을 시작하지 않는다. 받아 줄 worker 없이 오버레이가 버퍼링을 시작하면 쓰기가 메모리에 무한히 쌓인다.
+  (4) `spawnServer`는 디스크의 `cli.ts`가 필요하다. 번들에서는 `cliPath`를 받거나 원인을 명시한 에러를 던진다.
 - **계약 변경점**: (1) 단일 writer는 `EXCLUSIVE` 잠금 대신 `<db>.lock` 파일(pid)로 강제한다. (2) **IDLE 중 버퍼된 쓰기는 반영 전까지 메모리에만 있다.** 정상 종료는 반영 후 닫지만, 비정상 종료 시 유실된다(수용한 트레이드오프).
 
 ---

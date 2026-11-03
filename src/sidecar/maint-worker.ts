@@ -16,15 +16,20 @@
  * pressure / shutdown) or `maxMs` elapses; the next cycle resumes where it
  * left off (a half-reclaimed key is still expired, so it never reads back).
  *
+ * Packaging: the worker is started from a Blob URL built out of
+ * `runJob.toString()` (see maintenance.ts), never from this file's path, so
+ * it keeps working when an application bundles bundis (`bun build`, also
+ * minified) and the .ts file is not on disk. That is why `runJob` must be
+ * self-contained: no references to module-level values or imports — the
+ * Database class comes in as a parameter, constants live inside.
+ *
  * Shared control block (Int32Array over a SharedArrayBuffer):
  *   [0] abort flag (main → worker)
  *   [1] busy flag  (1 while a job holds a connection; worker clears it and
  *       notifies after closing the database, so shutdown can Atomics.wait)
  */
 
-import { Database } from "bun:sqlite";
-
-declare const self: Worker;
+import type { Database } from "bun:sqlite";
 
 export interface MaintJob {
   readonly path: string;
@@ -48,18 +53,24 @@ export interface MaintResult {
   error: string | null;
 }
 
-const CHILD: Record<string, { table: string; col: string }> = {
-  string: { table: "kv", col: "key" },
-  hash: { table: "hash_fields", col: "field" },
-  set: { table: "set_members", col: "member" },
-  list: { table: "list_items", col: "seq" },
-  zset: { table: "zset_members", col: "member" },
-};
+/** Control-block slots (duplicated inside runJob, which must be self-contained). */
+export const CTL_ABORT = 0;
+export const CTL_BUSY = 1;
 
-const ABORT = 0;
-const BUSY = 1;
-
-export function runJob(job: MaintJob): MaintResult {
+/**
+ * One maintenance job. Self-contained by contract (shipped as source text to
+ * a Blob-URL worker): only its parameters and JS/Bun globals may be used.
+ */
+export function runJob(job: MaintJob, Db: typeof Database): MaintResult {
+  const CHILD: Record<string, { table: string; col: string }> = {
+    string: { table: "kv", col: "key" },
+    hash: { table: "hash_fields", col: "field" },
+    set: { table: "set_members", col: "member" },
+    list: { table: "list_items", col: "seq" },
+    zset: { table: "zset_members", col: "member" },
+  };
+  const ABORT = 0;
+  const BUSY = 1;
   const ctl = new Int32Array(job.control);
   const start = performance.now();
   const res: MaintResult = {
@@ -91,7 +102,7 @@ export function runJob(job: MaintJob): MaintResult {
 
   let db: Database | null = null;
   try {
-    db = new Database(job.path);
+    db = new Db(job.path);
     db.exec("PRAGMA busy_timeout = 5000;");
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA journal_size_limit = 67108864;");
@@ -171,11 +182,4 @@ export function runJob(job: MaintJob): MaintResult {
     Atomics.notify(ctl, BUSY);
   }
   return res;
-}
-
-// Worker entry (no-op when imported on the main thread, e.g. by tests).
-if (!Bun.isMainThread) {
-  self.onmessage = (ev: MessageEvent<MaintJob>) => {
-    self.postMessage(runJob(ev.data));
-  };
 }

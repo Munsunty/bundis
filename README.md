@@ -68,7 +68,9 @@ that your code using `Bun.RedisClient` runs unchanged, persisted to SQLite.
 ## Requirements
 
 - **[Bun](https://bun.sh) ≥ 1.1** (the `bun:sqlite` + `Bun.RedisClient` APIs).
-- That's the whole list.
+- That's the whole list. bundis is tested on **Bun 1.4.4**, and the maintenance
+  write guard needs ≥ 1.4.4 (on older Bun it is skipped). Pin your runtime to
+  ≥ 1.4.4 to run what the tests cover.
 
 ## Install
 
@@ -151,10 +153,11 @@ Every option has a sensible internal default — none are required.
 | `cacheIdleSec` | `--cache-idle` / `REDIS_CACHE_IDLE_SEC` | `300` | Hot-cache base time-to-idle. |
 | `reaperIntervalMs` | `--reaper` / `REDIS_REAPER_MS` | `100` | Active-expiry sweep interval. |
 | `maxClients` | `--max-clients` / `REDIS_MAX_CLIENTS` | `10000` | Connection cap. |
-| `maintenance` | `--maintenance` / `REDIS_MAINTENANCE` | `off` | `worker` = background data cleanup ([below](#background-maintenance-worker-mode)). |
+| `maintenance` | `--maintenance` / `REDIS_MAINTENANCE` | `auto` | Background data cleanup ([below](#background-maintenance-worker-mode)): `auto` = on for file databases, off for `:memory:`; `off` opts out; `worker` forces it. |
 | `maint` | `--maint-<name> <value>` | — | Initial maintenance parameters (same names as `CONFIG SET`). |
 
-`spawnServer` also accepts `bunPath` and `readyTimeoutMs`. The returned `url`
+`spawnServer` also accepts `bunPath`, `readyTimeoutMs` and `cliPath` (see
+[bundling](#bundling-your-app)). The returned `url`
 already embeds the password when one is set.
 
 > 🔒 **Security defaults:** bundis binds to `127.0.0.1` by default. Before
@@ -204,11 +207,14 @@ are in [`PERFORMANCE.md`](./PERFORMANCE.md); reproduce with `bun run bench/run.t
 
 Deleting data is synchronous in SQLite, and bundis serves every connection from
 one thread — so a big delete stalls everyone (a 1M-field hash takes ~2 s to
-`DEL`). Worker mode moves that work off the event loop:
+`DEL`). Worker mode moves that work off the event loop. It is **on by default
+for file databases** (`maintenance: "auto"`); `:memory:` databases fall back
+to the plain path silently:
 
 ```ts
-embedServer({ dbPath: "./data.db", maintenance: "worker" });
-// or: bunx bundis --db ./data.db --maintenance worker --maint-interval-sec 30
+embedServer({ dbPath: "./data.db" });                     // worker maintenance on
+embedServer({ dbPath: "./data.db", maintenance: "off" }); // opt out
+// CLI: bunx bundis --db ./data.db --maint-interval-sec 30
 ```
 
 - **Lazy delete:** `DEL`/`UNLINK` of a hash/set/list/zset and `FLUSHALL` only
@@ -256,7 +262,28 @@ Trade-offs, stated plainly:
 - Rewriting a deleted big key before a cycle reclaims it (e.g. `DEL big` then
   `HSET big …`) still purges the old rows inline.
 - `FLUSHALL` is O(number of keys) (~0.5 µs/key), no longer O(rows).
-- `:memory:` databases can't use worker mode (the worker can't share them).
+- `:memory:` databases can't use worker mode (the worker can't share them);
+  `auto` turns it off for them.
+- If the worker thread cannot start, maintenance disables itself
+  (`maint_worker:failed` and the reason in `INFO`); writes keep going straight
+  to SQLite and no cycle is ever started without a live worker.
+
+## Bundling your app
+
+bundis ships TypeScript source, so it goes through your bundler like your own
+code:
+
+- **Worker maintenance works in bundles** (`bun build`, also minified): the
+  worker starts from a Blob URL built from its own function source, not from
+  a file path.
+- **`spawnServer` needs bundis's CLI on disk.** A bundle no longer has it, so
+  `spawnServer` throws `bundis CLI not found … pass cliPath`. Pass
+  `cliPath: "node_modules/bundis/src/cli.ts"` (an installed copy), or use
+  `embedServer` / the `bunx bundis` daemon instead.
+- Your `tsc` type-checks bundis's sources too (`skipLibCheck` covers only
+  `.d.ts`). bundis compiles under the default libs (including DOM) and with
+  older `@types/bun` (checked down to 1.4.0); `bun run typecheck` checks both
+  the Bun-only and the DOM lib configuration.
 
 ## Supported commands
 

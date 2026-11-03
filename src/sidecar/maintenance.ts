@@ -24,11 +24,16 @@
  *   - a failed flush slice keeps its entries and retries with backoff
  *   - shutdown aborts the worker, waits for it to release the database, then
  *     drains the buffer synchronously (a clean stop never loses writes)
+ *   - no cycle starts unless the worker reported ready: a worker that failed
+ *     to start must never leave the overlay buffering with nobody to finish
+ *     the cycle (writes would pile up in memory indefinitely)
+ *   - watchdog: a worker silent past maint-max-run-ms + 30 s is aborted, and
+ *     the cycle completes once it has released the database
  */
 
 import type { OverlayStorage } from "../storage/overlay";
 import type { SqliteStorage } from "../storage/sqlite";
-import type { MaintJob, MaintResult } from "./maint-worker";
+import { runJob, type MaintJob, type MaintResult } from "./maint-worker";
 
 export type EvictionPolicy = "noeviction" | "volatile-ttl";
 export type MaintState = "normal" | "idle" | "flushing";
@@ -139,11 +144,34 @@ const MAXKEYS_CHECK_MS = 10_000;
 const BACKLOG_STATUS_CAP = 100_000;
 const ABORT = 0;
 const BUSY = 1;
+const WATCHDOG_GRACE_MS = 30_000;
+const READY = "bundis:maint-ready";
+
+/**
+ * Worker source built from runJob's own text and started from a Blob URL —
+ * never from a file path — so it survives `bun build` bundling/minifying,
+ * where maint-worker.ts is not on disk next to the bundle.
+ */
+function workerSource(): string {
+  return (
+    'import { Database } from "bun:sqlite";\n' +
+    `const runJob = ${runJob.toString()};\n` +
+    "self.onmessage = (ev) => self.postMessage(runJob(ev.data, Database));\n" +
+    `self.postMessage(${JSON.stringify(READY)});\n`
+  );
+}
+
+type WorkerState = "starting" | "ready" | "failed";
 
 export class Maintenance {
   readonly params: MaintParams;
   #state: MaintState = "normal";
   #worker: Worker | null = null;
+  #workerUrl: string | null = null;
+  #workerState: WorkerState = "starting";
+  /** MAINT RUN arrived while the worker was still starting. */
+  #pendingRun = false;
+  #watchdog: ReturnType<typeof setTimeout> | null = null;
   readonly #control = new SharedArrayBuffer(8);
   readonly #ctl = new Int32Array(this.#control);
   #tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -185,16 +213,48 @@ export class Maintenance {
 
   /** Begin the trigger loop and the worker thread. */
   start(): void {
-    this.#worker = new Worker(new URL("./maint-worker.ts", import.meta.url).href);
-    this.#worker.onmessage = (ev: MessageEvent<MaintResult>) => this.#onWorkerDone(ev.data);
-    this.#worker.onerror = (ev) => {
-      this.#lastError = `worker error: ${(ev as ErrorEvent).message ?? String(ev)}`;
-      console.error("bundis: maintenance", this.#lastError);
-      if (this.#state === "idle") this.#onWorkerDone(null);
+    try {
+      this.#workerUrl = URL.createObjectURL(new Blob([workerSource()], { type: "text/javascript" }));
+      this.#worker = new Worker(this.#workerUrl);
+    } catch (err) {
+      this.#workerFailed(`worker could not be created: ${String(err)}`);
+      return;
+    }
+    this.#worker.onmessage = (ev: MessageEvent<MaintResult | typeof READY>) => {
+      if (ev.data === READY) {
+        this.#workerState = "ready";
+        if (this.#pendingRun) {
+          this.#pendingRun = false;
+          this.runNow();
+        }
+        return;
+      }
+      this.#onWorkerDone(ev.data);
     };
-    this.#worker.unref();
+    this.#worker.onerror = (ev) => {
+      this.#workerFailed(`worker error: ${(ev as ErrorEvent).message ?? String(ev)}`);
+    };
+    // Bun's Worker has unref(); the DOM lib's Worker type (which consumers'
+    // tsconfig may pick up) does not, hence the structural cast.
+    (this.#worker as unknown as { unref?: () => void }).unref?.();
     this.#tickTimer = setInterval(() => this.#tick(), TICK_MS);
     this.#tickTimer.unref?.();
+  }
+
+  /**
+   * The worker is gone (failed to load, or threw outside runJob — runJob
+   * itself catches everything and closes its connection). No cycle starts
+   * again; a cycle in flight completes so the buffer drains.
+   */
+  #workerFailed(message: string): void {
+    this.#workerState = "failed";
+    this.#pendingRun = false;
+    this.#lastError = message;
+    console.error("bundis: maintenance disabled:", message);
+    if (this.#state === "idle") {
+      Atomics.store(this.#ctl, BUSY, 0); // a dead worker holds no connection
+      this.#onWorkerDone(null);
+    }
   }
 
   /** Apply already-validated parameter updates. */
@@ -215,7 +275,12 @@ export class Maintenance {
   /** MAINT RUN: start a cycle now. Returns an error message when it cannot. */
   runNow(): string | null {
     if (this.#closed) return "maintenance is shut down";
+    if (this.#workerState === "failed") return `maintenance worker failed: ${this.#lastError}`;
     if (this.#state !== "normal") return `a maintenance cycle is already running (${this.#state})`;
+    if (this.#workerState === "starting") {
+      this.#pendingRun = true; // runs as soon as the worker reports ready
+      return null;
+    }
     // Deferred: never begin inside a command dispatch (which may sit inside a
     // group-commit transaction on the main connection).
     setTimeout(() => {
@@ -237,6 +302,7 @@ export class Maintenance {
     const ov = this.overlay.overlayStats();
     return {
       maint_mode: "worker",
+      maint_worker: this.#workerState,
       maint_enabled: this.params.enabled ? 1 : 0,
       maint_state: this.#state,
       maint_cycles: this.#cycles,
@@ -275,6 +341,7 @@ export class Maintenance {
     this.#closed = true;
     if (this.#tickTimer) clearInterval(this.#tickTimer);
     if (this.#flushTimer) clearTimeout(this.#flushTimer);
+    if (this.#watchdog) clearTimeout(this.#watchdog);
     if (this.#state === "idle") {
       Atomics.store(this.#ctl, ABORT, 1);
       Atomics.wait(this.#ctl, BUSY, 1, 10_000);
@@ -288,6 +355,8 @@ export class Maintenance {
     }
     this.#worker?.terminate();
     this.#worker = null;
+    if (this.#workerUrl) URL.revokeObjectURL(this.#workerUrl);
+    this.#workerUrl = null;
     this.#state = "normal";
   }
 
@@ -295,6 +364,7 @@ export class Maintenance {
 
   #tick(): void {
     if (this.#closed || !this.params.enabled || this.#state !== "normal") return;
+    if (this.#workerState !== "ready") return;
     const now = Date.now();
     const p = this.params;
     let reason: string | null = null;
@@ -324,8 +394,8 @@ export class Maintenance {
     } catch (err) {
       this.#lastError = `eviction failed: ${String(err)}`;
     }
-    if (!this.#worker) {
-      this.#lastError = "worker not started";
+    if (!this.#worker || this.#workerState !== "ready") {
+      this.#lastError = "worker not ready";
       return;
     }
     const job: MaintJob = {
@@ -342,6 +412,25 @@ export class Maintenance {
     this.overlay.activate();
     this.#state = "idle";
     this.#worker.postMessage(job);
+    this.#watchdog = setTimeout(() => this.#onWatchdog(), this.params.maxRunMs + WATCHDOG_GRACE_MS);
+    this.#watchdog.unref?.();
+  }
+
+  /** The worker overran its budget by far: abort it, finish once it let go. */
+  #onWatchdog(): void {
+    this.#watchdog = null;
+    if (this.#closed || this.#state !== "idle") return;
+    Atomics.store(this.#ctl, ABORT, 1);
+    this.#lastError = "worker unresponsive; aborted by watchdog";
+    console.error("bundis: maintenance:", this.#lastError);
+    const poll = setInterval(() => {
+      if (this.#closed || this.#state !== "idle") return clearInterval(poll);
+      if (Atomics.load(this.#ctl, BUSY) === 0) {
+        clearInterval(poll);
+        this.#onWorkerDone(null);
+      }
+    }, 100);
+    poll.unref?.();
   }
 
   /** Tombstone up to evict-batch keys when over maxkeys / maxdisk (volatile-ttl). */
@@ -359,6 +448,10 @@ export class Maintenance {
 
   #onWorkerDone(res: MaintResult | null): void {
     if (this.#closed || this.#state !== "idle") return;
+    if (this.#watchdog) {
+      clearTimeout(this.#watchdog);
+      this.#watchdog = null;
+    }
     if (res) {
       this.#lastWorker = res;
       this.#keysReclaimed += res.keysReclaimed;
