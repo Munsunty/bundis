@@ -113,6 +113,12 @@ export function info(ctx: CommandContext): Reply {
       "",
     );
   }
+  const maint = ctx.server.maintenance;
+  if (maint) {
+    lines.push("# Maintenance");
+    for (const [k, v] of Object.entries(maint.status(ctx.nowMs))) lines.push(`${k}:${v}`);
+    lines.push("");
+  }
   return R.verbatim("txt", lines.join("\r\n"));
 }
 

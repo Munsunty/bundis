@@ -12,6 +12,7 @@ import type { StorageEngine } from "../storage/types";
 import type { PubSubHub } from "../sidecar/pubsub";
 import type { WatchRegistry } from "../sidecar/watch";
 import type { ServerConfig } from "../config";
+import type { Maintenance } from "../sidecar/maintenance";
 import { Errors, NotIntegerError } from "./errors";
 
 export interface ServerContext {
@@ -19,6 +20,8 @@ export interface ServerContext {
   readonly hub: PubSubHub;
   readonly watch: WatchRegistry;
   readonly config: ServerConfig;
+  /** Worker-mode maintenance controller, or null when maintenance is off. */
+  readonly maintenance?: Maintenance | null;
 }
 
 const decoder = new TextDecoder();

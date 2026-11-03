@@ -160,3 +160,18 @@ export interface StorageEngine {
   /** Close underlying resources. */
   close(): void;
 }
+
+/**
+ * Extra primitives a base engine must offer so {@link ../storage/overlay.OverlayStorage}
+ * can buffer writes in memory and later apply them (worker maintenance mode).
+ */
+export interface OverlayBase extends StorageEngine {
+  /** Live type + absolute expiry, or null when missing/expired. */
+  metaOf(key: Uint8Array, now: number): { type: RedisType; expireAtMs: number | null } | null;
+  /** Child rows of `key` in its type's value table, counting at most `limit`. */
+  countUpTo(key: Uint8Array, type: RedisType, limit: number): number;
+  /** Overwrite a key row's expiry without a liveness check; false if no row. */
+  setExpireRaw(key: Uint8Array, expireAtMs: number | null): boolean;
+  /** Logically delete every key in O(keys) without touching child rows. */
+  tombstoneAll(): number;
+}

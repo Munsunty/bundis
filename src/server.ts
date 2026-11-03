@@ -14,11 +14,14 @@ import { ProtocolError } from "./resp/parser";
 import { R } from "./resp/types";
 import { SqliteStorage } from "./storage/sqlite";
 import { HotCacheStorage } from "./storage/cache";
+import { OverlayStorage } from "./storage/overlay";
 import type { StorageEngine } from "./storage/types";
 import { PubSubHub } from "./sidecar/pubsub";
 import { releaseSnapshot, WatchRegistry } from "./sidecar/watch";
 import { MemoryGuard } from "./sidecar/memory-guard";
 import { ExpiryReaper } from "./sidecar/reaper";
+import { Maintenance } from "./sidecar/maintenance";
+import { acquireDbLock, assertDbUnlocked } from "./sidecar/lockfile";
 import type { ServerConfig } from "./config";
 import type { ServerContext } from "./engine/context";
 
@@ -46,31 +49,88 @@ export interface RunningServer {
 
 export function startServer(config: ServerConfig): RunningServer {
   const watch = new WatchRegistry();
+  const fileDb = config.dbPath !== ":memory:" && config.dbPath !== "";
+  if (config.maintenance === "worker" && !fileDb) {
+    // The worker needs its own connection to the same file; an in-memory
+    // database is private to one connection.
+    console.error("bundis: --maintenance worker needs a file database; maintenance disabled");
+  }
+  const workerMode = config.maintenance === "worker" && fileDb;
+  // Single-writer contract: worker mode cannot use EXCLUSIVE locking (it needs
+  // a second connection), so it holds a lock file; exclusive mode refuses to
+  // open a file that a live worker-mode server holds.
+  let releaseLock: (() => void) | null = null;
+  if (workerMode) releaseLock = acquireDbLock(config.dbPath);
+  else if (fileDb) assertDbUnlocked(config.dbPath);
+
   let cache: HotCacheStorage | null = null;
-  const sqlite = new SqliteStorage(config.dbPath, {
-    onWrite: (key) => {
-      watch.bump(key);
-      cache?.invalidate(key); // every mutation evicts its stale cache entry
-    },
-    onFlushAll: () => {
-      watch.bumpAll();
-      cache?.invalidateAll();
-    },
-    // 50% of the overall memory budget goes to the SQLite page cache.
-    pageCacheKb: Math.floor(config.maxMemoryBytes / 2 / 1024),
-  });
+  let overlay: OverlayStorage | null = null;
+  let maintenance: Maintenance | null = null;
+  let sqlite: SqliteStorage;
+  try {
+    sqlite = new SqliteStorage(config.dbPath, {
+      onWrite: (key) => {
+        // Applying the IDLE buffer only converges SQLite to the merged view
+        // that WATCH versions and the hot cache already reflect (both were
+        // updated when the buffered write happened). Re-bumping would abort
+        // innocent EXECs; re-invalidating would evict every key written
+        // during maintenance from the write-through cache.
+        if (overlay?.applying) return;
+        watch.bump(key);
+        cache?.invalidate(key); // every mutation evicts its stale cache entry
+      },
+      onFlushAll: () => {
+        if (overlay?.applying) return;
+        watch.bumpAll();
+        cache?.invalidateAll();
+      },
+      // 50% of the overall memory budget goes to the SQLite page cache.
+      pageCacheKb: Math.floor(config.maxMemoryBytes / 2 / 1024),
+      exclusive: !workerMode,
+      lazyDelete: workerMode,
+      incrementalVacuum: workerMode,
+    });
+    if (workerMode) {
+      overlay = new OverlayStorage(
+        sqlite,
+        {
+          onWrite: (key) => {
+            watch.bump(key);
+            cache?.invalidate(key);
+          },
+          onFlushAll: () => {
+            watch.bumpAll();
+            cache?.invalidateAll();
+          },
+          onPressure: () => maintenance?.onPressure(),
+        },
+        // The worker owns physical deletion; the main thread never sweeps.
+        { mainThreadSweep: false },
+      );
+      maintenance = new Maintenance(sqlite, overlay, config.maintParams ?? {});
+      // Runtime enforcement of the IDLE invariant: while the overlay buffers
+      // (and is not applying its buffer), no write statement may reach SQLite.
+      const ov = overlay;
+      sqlite.setWriteGuard(() => ov.active && !ov.applying);
+    }
+  } catch (err) {
+    releaseLock?.();
+    throw err;
+  }
+  const engine: StorageEngine = overlay ?? sqlite;
   const storage: StorageEngine =
     config.cacheMaxBytes > 0
-      ? (cache = new HotCacheStorage(sqlite, {
+      ? (cache = new HotCacheStorage(engine, {
           maxBytes: config.cacheMaxBytes,
           baseIdleMs: config.cacheIdleMs,
         }))
-      : sqlite;
+      : engine;
   const hub = new PubSubHub();
-  const ctx: ServerContext = { storage, hub, watch, config };
+  const ctx: ServerContext = { storage, hub, watch, config, maintenance };
 
   const reaper = new ExpiryReaper(storage, config.reaperIntervalMs);
   reaper.start();
+  maintenance?.start();
 
   // Aggregate buffer ceiling across all connections (inbound parser + outbound
   // backpressure), independent of per-connection caps.
@@ -110,7 +170,8 @@ export function startServer(config: ServerConfig): RunningServer {
             // Group commit: one WAL commit for the whole pipelined batch.
             // dispatch() never throws (errors become RESP replies), so the
             // transaction always commits; replies flush after (uncork below).
-            sqlite.withTransaction(() => {
+            // (Through the overlay: while it buffers, nothing hits SQLite.)
+            engine.withTransaction(() => {
               for (const command of commands) dispatch(conn, command, ctx, now);
             });
           } else {
@@ -161,7 +222,10 @@ export function startServer(config: ServerConfig): RunningServer {
     stop() {
       reaper.stop();
       listener.stop(true);
+      // Drains the IDLE write buffer into SQLite before the file closes.
+      maintenance?.shutdown();
       storage.close();
+      releaseLock?.();
     },
   };
 }

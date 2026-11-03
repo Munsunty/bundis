@@ -1,6 +1,6 @@
 {
   "name": "bundis",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Munsunty/bundis.git"
@@ -41,6 +41,7 @@
     "start": "bun run src/cli.ts",
     "dev": "bun --watch run src/cli.ts",
     "test": "bun test",
+    "test:worker": "BUNDIS_TEST_MAINTENANCE=worker bun test tests/contract",
     "typecheck": "bun x tsc --noEmit"
   },
   "type": "module"
