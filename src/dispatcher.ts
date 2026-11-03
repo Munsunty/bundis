@@ -139,6 +139,7 @@ const TABLE: Record<string, Handler> = {
   FLUSHALL: admin.flushall,
   CONFIG: admin.config,
   COMMAND: admin.command,
+  MAINT: admin.maint,
 };
 
 /** Number of dispatchable commands (COMMAND COUNT). */

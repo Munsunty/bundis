@@ -37,6 +37,17 @@ export interface LaunchOptions {
   cacheMb?: number;
   /** Hot-cache base time-to-idle in seconds (default 300). */
   cacheIdleSec?: number;
+  /**
+   * "worker" runs data cleanup (expired/deleted rows, disk reclaim) on a
+   * background thread while writes buffer in memory (default "off").
+   * Requires a file database.
+   */
+  maintenance?: "off" | "worker";
+  /**
+   * Initial maintenance parameters by CONFIG name, e.g.
+   * `{ "maint-interval-sec": 30 }`. Adjustable later with CONFIG SET.
+   */
+  maint?: Record<string, string | number | boolean>;
 }
 
 export interface EmbeddedServer {
@@ -102,6 +113,8 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Spawne
       "--max-memory-mb", String(Math.floor(config.maxMemoryBytes / (1024 * 1024))),
       "--cache-mb", String(Math.floor(config.cacheMaxBytes / (1024 * 1024))),
       "--cache-idle", String(Math.floor(config.cacheIdleMs / 1000)),
+      "--maintenance", config.maintenance ?? "off",
+      ...Object.entries(config.maintParams ?? {}).flatMap(([k, v]) => [`--${k}`, v]),
     ],
     { stdout: "pipe", stderr: "inherit", env },
   );
@@ -144,6 +157,13 @@ function resolveConfig(opts: LaunchOptions): ServerConfig {
     maxMemoryBytes: maxMemoryMb * MB,
     cacheMaxBytes: (opts.cacheMb ?? Math.floor(maxMemoryMb / 4)) * MB,
     cacheIdleMs: (opts.cacheIdleSec ?? 300) * 1000,
+    maintenance: opts.maintenance ?? "off",
+    maintParams: Object.fromEntries(
+      Object.entries(opts.maint ?? {}).map(([k, v]) => [
+        k,
+        typeof v === "boolean" ? (v ? "yes" : "no") : String(v),
+      ]),
+    ),
   };
 }
 

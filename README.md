@@ -151,6 +151,8 @@ Every option has a sensible internal default — none are required.
 | `cacheIdleSec` | `--cache-idle` / `REDIS_CACHE_IDLE_SEC` | `300` | Hot-cache base time-to-idle. |
 | `reaperIntervalMs` | `--reaper` / `REDIS_REAPER_MS` | `100` | Active-expiry sweep interval. |
 | `maxClients` | `--max-clients` / `REDIS_MAX_CLIENTS` | `10000` | Connection cap. |
+| `maintenance` | `--maintenance` / `REDIS_MAINTENANCE` | `off` | `worker` = background data cleanup ([below](#background-maintenance-worker-mode)). |
+| `maint` | `--maint-<name> <value>` | — | Initial maintenance parameters (same names as `CONFIG SET`). |
 
 `spawnServer` also accepts `bunPath` and `readyTimeoutMs`. The returned `url`
 already embeds the password when one is set.
@@ -198,6 +200,64 @@ are in [`PERFORMANCE.md`](./PERFORMANCE.md); reproduce with `bun run bench/run.t
 > over loopback TCP, not a claim of Redis-equal throughput. bundis targets the
 > "no separate Redis, data on disk, runs on Bun" niche.
 
+## Background maintenance (worker mode)
+
+Deleting data is synchronous in SQLite, and bundis serves every connection from
+one thread — so a big delete stalls everyone (a 1M-field hash takes ~2 s to
+`DEL`). Worker mode moves that work off the event loop:
+
+```ts
+embedServer({ dbPath: "./data.db", maintenance: "worker" });
+// or: bunx bundis --db ./data.db --maintenance worker --maint-interval-sec 30
+```
+
+- **Lazy delete:** `DEL`/`UNLINK` of a hash/set/list/zset and `FLUSHALL` only
+  mark keys expired (O(1) per key). They are gone for clients immediately.
+- **Cycles:** a worker thread with its own SQLite connection reclaims expired
+  and deleted rows in small chunks, returns free pages to the filesystem
+  (`incremental_vacuum`) and checkpoints the WAL.
+- **No write stalls:** during a cycle (IDLE), writes are buffered in memory and
+  reads merge buffer + SQLite (WAL allows reading while the worker writes).
+  Only keys written during IDLE are buffered; cold data stays in SQLite. When
+  the worker finishes, the buffer is applied in small time-budgeted slices.
+- **Runtime control:** every knob is a `CONFIG SET` parameter:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `maint-enabled` | `yes` | Automatic cycles on/off (`MAINT RUN` still works). |
+| `maint-interval-sec` | `60` | Periodic cycle; `0` = off. |
+| `maint-expired-threshold` | `10000` | Start a cycle when this many expired/deleted keys await reclaim; `0` = off. |
+| `maint-max-run-ms` | `5000` | Time cap per worker run (leftovers resume next cycle). |
+| `maint-chunk-rows` | `2000` | Rows deleted per worker transaction. |
+| `maint-buffer-max-mb` | `64` | Write-buffer size that makes the worker stop early. |
+| `maint-flush-budget-ms` | `5` | Max event-loop time per buffer-apply slice. |
+| `maint-vacuum-step-pages` | `256` | Pages per `incremental_vacuum` step; `0` = no disk reclaim. |
+| `maint-maxkeys` / `maint-maxdisk-mb` | `0` | Limits that trigger a cycle (and eviction); `0` = off. |
+| `maint-eviction-policy` | `noeviction` | `volatile-ttl`: when over a limit, evict soonest-expiring TTL keys first. |
+| `maint-evict-batch` | `1000` | Max keys evicted per cycle. |
+
+```ts
+await client.send("CONFIG", ["SET", "maint-flush-budget-ms", "2", "maint-chunk-rows", "5000"]);
+await client.send("MAINT", ["RUN"]);     // start a cycle now
+await client.send("MAINT", ["STATUS"]);  // same fields as INFO's "# Maintenance"
+```
+
+Trade-offs, stated plainly:
+
+- **Durability during a cycle:** buffered writes live in memory until applied.
+  A clean stop (`stop()`, SIGTERM/SIGINT) applies them first; a hard crash
+  during a cycle loses them.
+- **Single writer via lock file:** the worker needs a second connection, so
+  SQLite's exclusive locking is off and `<db>.lock` (holding the pid) keeps
+  other bundis processes out. A stale lock from a dead process is taken over.
+- Disk reclaim needs `auto_vacuum = INCREMENTAL`, which worker mode sets on
+  **new** database files; existing files need one offline `VACUUM` after
+  `PRAGMA auto_vacuum = INCREMENTAL` (check `disk_auto_vacuum` in `INFO`).
+- Rewriting a deleted big key before a cycle reclaims it (e.g. `DEL big` then
+  `HSET big …`) still purges the old rows inline.
+- `FLUSHALL` is O(number of keys) (~0.5 µs/key), no longer O(rows).
+- `:memory:` databases can't use worker mode (the worker can't share them).
+
 ## Supported commands
 
 The server doesn't distinguish "dedicated method" from `client.send(...)` — every
@@ -216,7 +276,8 @@ command arrives as the same RESP array. Coverage grows by adding dispatch cases.
   ZSCORE, ZRANK, ZCARD, ZREM
 - **Pub/Sub:** SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH, PUBSUB
 - **Transactions:** MULTI, EXEC, DISCARD, WATCH, UNWATCH
-- **Server / admin:** TYPE, DBSIZE, FLUSHDB, FLUSHALL, CONFIG GET/SET, COMMAND
+- **Server / admin:** TYPE, DBSIZE, FLUSHDB, FLUSHALL, CONFIG GET/SET, COMMAND,
+  MAINT RUN/STATUS (worker mode)
 
 `getBuffer()` is binary-safe (values are stored as BLOBs), `EXISTS`/`SISMEMBER`
 coerce to booleans, zset scores reply as RESP3 doubles, and pub/sub delivers
@@ -257,7 +318,9 @@ src/
   dispatcher.ts   L4 command routing table
   commands/       L5 command semantics
   storage/        L6 StorageEngine + SqliteStorage (WAL) + HotCacheStorage
-  sidecar/        L7 ExpiryReaper, PubSubHub, WatchRegistry, MemoryGuard
+                  + OverlayStorage (write buffer for worker maintenance)
+  sidecar/        L7 ExpiryReaper, PubSubHub, WatchRegistry, MemoryGuard,
+                  Maintenance (+ maint-worker thread, lock file)
 tests/
   unit/           modules in isolation (no network)
   contract/       stock Bun.RedisClient over real TCP

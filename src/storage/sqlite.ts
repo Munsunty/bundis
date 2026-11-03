@@ -58,19 +58,56 @@ export interface SqliteStorageOptions {
   readonly onFlushAll?: () => void;
   /** SQLite page-cache size in KB (PRAGMA cache_size). Default: SQLite's own. */
   readonly pageCacheKb?: number;
+  /**
+   * Hold the file lock for the process lifetime (PRAGMA locking_mode =
+   * EXCLUSIVE). Default true. Worker maintenance needs a second connection to
+   * the same file, so it turns this off and enforces the single-writer
+   * contract with a lock file instead (see sidecar/lockfile.ts).
+   */
+  readonly exclusive?: boolean;
+  /**
+   * Lazy delete: DEL of a non-string key only tombstones it (expire_at_ms = 0,
+   * O(1)); the maintenance worker reclaims the child rows later. Default false.
+   */
+  readonly lazyDelete?: boolean;
+  /** New database files get auto_vacuum = INCREMENTAL (enables disk reclaim). */
+  readonly incrementalVacuum?: boolean;
 }
+
+/** Disk usage snapshot (PRAGMA page_count / freelist_count / page_size). */
+export interface DiskStats {
+  readonly pageSize: number;
+  readonly pageCount: number;
+  readonly freelistCount: number;
+  /** 0 = none, 1 = full, 2 = incremental. */
+  readonly autoVacuum: number;
+}
+
+/** Value-table name + child-row column per type (used by bounded counts). */
+export const CHILD_TABLES: Record<RedisType, { table: string; col: string }> = {
+  string: { table: "kv", col: "key" },
+  hash: { table: "hash_fields", col: "field" },
+  set: { table: "set_members", col: "member" },
+  list: { table: "list_items", col: "seq" },
+  zset: { table: "zset_members", col: "member" },
+};
 
 export class SqliteStorage implements StorageEngine {
   #db: Database;
   #onWrite: (key: Uint8Array) => void;
   #onFlushAll: () => void;
+  readonly #lazyDelete: boolean;
+  /** Database file path as opened (":memory:" for in-memory). */
+  readonly path: string;
 
   constructor(path = ":memory:", opts: SqliteStorageOptions = {}) {
+    this.path = path;
+    this.#lazyDelete = opts.lazyDelete ?? false;
     try {
       this.#db = new Database(path, { create: true, strict: false });
       this.#onWrite = opts.onWrite ?? (() => {});
       this.#onFlushAll = opts.onFlushAll ?? (() => {});
-      this.#init(opts.pageCacheKb);
+      this.#init(opts.pageCacheKb, opts.exclusive ?? true, opts.incrementalVacuum ?? false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (/locked|busy/i.test(msg)) {
@@ -83,14 +120,23 @@ export class SqliteStorage implements StorageEngine {
     }
   }
 
-  #init(pageCacheKb?: number): void {
-    // Enforce the documented single-writer contract (§5.3): EXCLUSIVE locking
-    // holds the file lock for the process lifetime, so a second bundis on the
-    // same .db fails fast here instead of corrupting cache coherence later.
-    // (:memory: is unaffected; WAL+exclusive runs with a heap WAL-index.)
+  #init(pageCacheKb: number | undefined, exclusive: boolean, incrementalVacuum: boolean): void {
     this.#db.exec("PRAGMA busy_timeout = 2000;");
-    this.#db.exec("PRAGMA locking_mode = EXCLUSIVE;");
+    if (exclusive) {
+      // Enforce the documented single-writer contract (§5.3): EXCLUSIVE locking
+      // holds the file lock for the process lifetime, so a second bundis on the
+      // same .db fails fast here instead of corrupting cache coherence later.
+      // (:memory: is unaffected; WAL+exclusive runs with a heap WAL-index.)
+      this.#db.exec("PRAGMA locking_mode = EXCLUSIVE;");
+    }
+    if (incrementalVacuum) {
+      // Only takes effect on a fresh file (before the first table exists);
+      // existing files keep their mode until a full VACUUM.
+      this.#db.exec("PRAGMA auto_vacuum = INCREMENTAL;");
+    }
     this.#db.exec("PRAGMA journal_mode = WAL;");
+    // Bound the WAL file left behind after checkpoints (64 MB).
+    this.#db.exec("PRAGMA journal_size_limit = 67108864;");
     this.#db.exec("PRAGMA synchronous = NORMAL;");
     this.#db.exec("PRAGMA foreign_keys = ON;");
     if (pageCacheKb !== undefined && pageCacheKb > 0) {
@@ -217,13 +263,115 @@ export class SqliteStorage implements StorageEngine {
     return this.withTransaction(() => {
       let n = 0;
       for (const key of keys) {
-        if (this.#meta(key, now) !== null) {
-          this.#deleteKey(key);
+        const meta = this.#meta(key, now);
+        if (meta !== null) {
+          // Lazy mode: a non-string key may own millions of child rows, so DEL
+          // only tombstones it (O(1)); the maintenance worker reclaims rows.
+          if (this.#lazyDelete && meta.type !== "string") this.tombstone(key);
+          else this.#deleteKey(key);
           n++;
         }
       }
       return n;
     });
+  }
+
+  // ── maintenance primitives (overlay / worker support) ──────────────────--
+
+  /** Live metadata of a key (type + absolute expiry), or null. */
+  metaOf(key: Uint8Array, now: number): { type: RedisType; expireAtMs: number | null } | null {
+    return this.#meta(key, now);
+  }
+
+  /**
+   * Logical delete in O(1): mark the key expired (expire_at_ms = 0). Reads
+   * treat it as absent immediately; physical removal of its rows is left to
+   * the expiry sweep / maintenance worker.
+   */
+  tombstone(key: Uint8Array): void {
+    this.#stmt("UPDATE keys SET expire_at_ms = 0 WHERE key = ?").run(key);
+    this.#onWrite(key);
+  }
+
+  /** Tombstone every key (lazy FLUSHALL). Returns the number of keys marked. */
+  tombstoneAll(): number {
+    const r = this.#stmt(
+      "UPDATE keys SET expire_at_ms = 0 WHERE expire_at_ms IS NULL OR expire_at_ms > 0",
+    ).run() as { changes: number };
+    this.#onFlushAll();
+    return r.changes;
+  }
+
+  /**
+   * Overwrite a key row's expiry without the liveness check (the overlay
+   * re-applies a buffered EXPIRE/PERSIST onto a row whose old TTL may have
+   * passed meanwhile). Returns false when no row exists.
+   */
+  setExpireRaw(key: Uint8Array, expireAtMs: number | null): boolean {
+    const r = this.#stmt("UPDATE keys SET expire_at_ms = ? WHERE key = ?").run(
+      expireAtMs,
+      key,
+    ) as { changes: number };
+    if (r.changes > 0) this.#onWrite(key);
+    return r.changes > 0;
+  }
+
+  /** Number of child rows of `key` in its type's table, counting at most `limit`. */
+  countUpTo(key: Uint8Array, type: RedisType, limit: number): number {
+    const { table } = CHILD_TABLES[type];
+    const row = this.#stmt(
+      `SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${table} WHERE key = ? LIMIT ?)`,
+    ).get(key, limit) as { n: number };
+    return row.n;
+  }
+
+  /** Expired-but-unreclaimed key rows, counting at most `limit` (cheap probe). */
+  expiredBacklog(now: number, limit: number): number {
+    const row = this.#stmt(
+      "SELECT COUNT(*) AS n FROM (SELECT 1 FROM keys " +
+        "WHERE expire_at_ms IS NOT NULL AND expire_at_ms <= ? LIMIT ?)",
+    ).get(now, limit) as { n: number };
+    return row.n;
+  }
+
+  /** Live key count, counting at most `limit` (bounded DBSIZE). */
+  liveKeysUpTo(now: number, limit: number): number {
+    const row = this.#stmt(
+      "SELECT COUNT(*) AS n FROM (SELECT 1 FROM keys " +
+        "WHERE expire_at_ms IS NULL OR expire_at_ms > ? LIMIT ?)",
+    ).get(now, limit) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * volatile-ttl eviction: tombstone up to `n` live keys that carry a TTL,
+   * soonest-expiring first (served by idx_keys_expire). Returns keys evicted.
+   */
+  evictVolatileTtl(n: number, now: number): number {
+    if (n <= 0) return 0;
+    return this.withTransaction(() => {
+      const rows = this.#stmt(
+        "UPDATE keys SET expire_at_ms = 0 WHERE key IN (" +
+          "SELECT key FROM keys WHERE expire_at_ms IS NOT NULL AND expire_at_ms > ? " +
+          "ORDER BY expire_at_ms LIMIT ?) RETURNING key",
+      ).all(now, n) as Array<{ key: Uint8Array }>;
+      for (const r of rows) this.#onWrite(r.key);
+      return rows.length;
+    });
+  }
+
+  /** Page-level disk usage (live bytes ≈ (pageCount - freelistCount) * pageSize). */
+  diskStats(): DiskStats {
+    const one = (pragma: string): number => {
+      const row = this.#db.query(`PRAGMA ${pragma}`).get() as Record<string, number>;
+      return Number(Object.values(row)[0] ?? 0);
+    };
+    return {
+      pageSize: one("page_size"),
+      pageCount: one("page_count"),
+      freelistCount: one("freelist_count"),
+      autoVacuum: one("auto_vacuum"),
+    };
   }
 
   expireSet(key: Uint8Array, atMs: number, now: number): boolean {
@@ -275,6 +423,12 @@ export class SqliteStorage implements StorageEngine {
   }
 
   flushAll(): void {
+    if (this.#lazyDelete) {
+      // Lazy mode: mark every key expired (~15x cheaper than deleting all child
+      // rows inline); the maintenance worker reclaims the rows.
+      this.tombstoneAll();
+      return;
+    }
     this.withTransaction(() => {
       // Children first: value tables reference keys.
       this.#stmt("DELETE FROM kv").run();
@@ -1064,7 +1218,7 @@ export class SqliteStorage implements StorageEngine {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function parseIntStrict(bytes: Uint8Array): bigint {
+export function parseIntStrict(bytes: Uint8Array): bigint {
   const s = DEC.decode(bytes).trim();
   if (!/^[+-]?\d+$/.test(s)) {
     throw new NotIntegerError();
@@ -1072,7 +1226,7 @@ function parseIntStrict(bytes: Uint8Array): bigint {
   return BigInt(s);
 }
 
-function parseFloatStrict(bytes: Uint8Array): number {
+export function parseFloatStrict(bytes: Uint8Array): number {
   const s = DEC.decode(bytes).trim();
   if (s.length === 0) throw new NotFloatError();
   const lower = s.toLowerCase();
@@ -1083,7 +1237,7 @@ function parseFloatStrict(bytes: Uint8Array): number {
   return n;
 }
 
-function formatFloat(n: number): string {
+export function formatFloat(n: number): string {
   if (n === Infinity) return "inf";
   if (n === -Infinity) return "-inf";
   // Trim trailing zeros the way Redis does for INCRBYFLOAT output.
@@ -1094,7 +1248,7 @@ function formatFloat(n: number): string {
   return Number(s).toString();
 }
 
-function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+export function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
   out.set(b, a.length);

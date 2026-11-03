@@ -1,18 +1,20 @@
 /**
- * Server/admin commands: TYPE, DBSIZE, FLUSHDB, FLUSHALL, CONFIG, COMMAND.
+ * Server/admin commands: TYPE, DBSIZE, FLUSHDB, FLUSHALL, CONFIG, COMMAND, MAINT.
  *
  * These exist because real tooling sends them before doing anything useful:
  * integration tests flush between cases, redis-cli probes TYPE/COMMAND on
  * connect, and client libraries (BullMQ, connect-redis, health checks) read
- * CONFIG GET at init. CONFIG SET is a lenient stub — it never honors
- * security-sensitive parameters (dir, save, …); values are accepted and
- * dropped so init-time probes succeed.
+ * CONFIG GET at init. CONFIG SET is lenient for Redis parameters — it never
+ * honors security-sensitive ones (dir, save, …); values are accepted and
+ * dropped so init-time probes succeed. The bundis-specific `maint-*`
+ * parameters (worker maintenance mode) are validated and applied at runtime.
  */
 
 import { R, type Reply } from "../resp/types";
 import { Errors } from "../engine/errors";
 import { commandCount } from "../dispatcher";
 import type { CommandContext } from "../engine/context";
+import { MAINT_PARAM_SPECS, parseMaintParams } from "../sidecar/maintenance";
 
 export function type(ctx: CommandContext): Reply {
   ctx.requireExactArgc(1);
@@ -44,6 +46,7 @@ function configValues(ctx: CommandContext): Record<string, string> {
     save: "",
     databases: "1",
     "proto-max-bulk-len": String(512 * 1024 * 1024),
+    ...ctx.server.maintenance?.configValues(),
   };
 }
 
@@ -64,11 +67,28 @@ export function config(ctx: CommandContext): Reply {
       }
       return R.map([...matched].map(([name, value]) => [R.bulk(name), R.bulk(value)]));
     }
-    case "SET":
-      // Lenient stub: accepted, never applied. Still validate arity like Redis
-      // (at least one name/value pair → an even number of trailing tokens).
+    case "SET": {
+      // Validate arity like Redis (at least one name/value pair → an even
+      // number of trailing tokens).
       if (ctx.argc < 3 || ctx.argc % 2 === 0) throw Errors.wrongArgs("config|set");
+      const maintPairs: Array<[string, string]> = [];
+      for (let i = 1; i < ctx.argc; i += 2) {
+        const name = ctx.str(i).toLowerCase();
+        if (name in MAINT_PARAM_SPECS) maintPairs.push([name, ctx.str(i + 1)]);
+        // Other parameters: lenient stub — accepted, never applied.
+      }
+      if (maintPairs.length > 0) {
+        const maint = ctx.server.maintenance;
+        if (!maint) {
+          return R.error("ERR", "maintenance is off (start the server with --maintenance worker)");
+        }
+        // All-or-nothing: validate every pair before applying any.
+        const parsed = parseMaintParams(maintPairs);
+        if ("error" in parsed) return R.error("ERR", parsed.error);
+        maint.apply(parsed.ok);
+      }
       return R.ok();
+    }
     case "RESETSTAT":
     case "REWRITE":
       return R.ok();
@@ -105,4 +125,29 @@ function globMatch(pattern: string, s: string): boolean {
     "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
   );
   return re.test(s);
+}
+
+/**
+ * MAINT RUN | STATUS — bundis extension for worker maintenance mode.
+ * RUN starts a cycle now; STATUS returns the same fields as INFO maintenance.
+ */
+export function maint(ctx: CommandContext): Reply {
+  ctx.requireExactArgc(1);
+  const m = ctx.server.maintenance;
+  if (!m) return R.error("ERR", "maintenance is off (start the server with --maintenance worker)");
+  switch (ctx.upper(0)) {
+    case "RUN": {
+      const err = m.runNow();
+      return err === null ? R.ok() : R.error("ERR", err);
+    }
+    case "STATUS":
+      return R.map(
+        Object.entries(m.status(ctx.nowMs)).map(([k, v]) => [
+          R.bulk(k),
+          typeof v === "number" && Number.isInteger(v) ? R.int(v) : R.bulk(String(v)),
+        ]),
+      );
+    default:
+      return R.error("ERR", `Unknown MAINT subcommand '${ctx.str(0)}' (expected RUN or STATUS)`);
+  }
 }

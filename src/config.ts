@@ -10,6 +10,10 @@
  *       50% SQLite page cache, 25% hot cache unless --cache-mb given)
  *   --cache-mb / REDIS_CACHE_MB  (default: maxMemory/4; 0 disables hot cache)
  *   --cache-idle / REDIS_CACHE_IDLE_SEC (default 300 — hot-cache base TTI)
+ *   --maintenance / REDIS_MAINTENANCE (default off; "worker" = background
+ *       maintenance thread, see sidecar/maintenance.ts — file-backed DBs only)
+ *   --maint-<name> <value>        initial value of a runtime maintenance
+ *       parameter (same names as CONFIG SET maint-*)
  */
 
 export interface ServerConfig {
@@ -31,7 +35,13 @@ export interface ServerConfig {
   cacheMaxBytes: number;
   /** Hot-cache base time-to-idle in ms. */
   cacheIdleMs: number;
+  /** "worker": background maintenance thread + write buffer (file DBs only). */
+  maintenance?: MaintenanceMode;
+  /** Initial maintenance parameters by CONFIG name (e.g. "maint-interval-sec"). */
+  maintParams?: Record<string, string>;
 }
+
+export type MaintenanceMode = "off" | "worker";
 
 export function loadConfig(argv: string[] = Bun.argv.slice(2)): ServerConfig {
   const flags = parseFlags(argv);
@@ -53,7 +63,17 @@ export function loadConfig(argv: string[] = Bun.argv.slice(2)): ServerConfig {
     maxMemoryBytes: maxMemoryMb * MB,
     cacheMaxBytes: cacheMb * MB,
     cacheIdleMs: int(flags["cache-idle"] ?? env.REDIS_CACHE_IDLE_SEC, 300) * 1000,
+    maintenance: maintenanceMode(flags.maintenance ?? env.REDIS_MAINTENANCE),
+    maintParams: Object.fromEntries(
+      Object.entries(flags).filter(([name]) => name.startsWith("maint-")),
+    ),
   };
+}
+
+function maintenanceMode(v: string | undefined): MaintenanceMode {
+  if (v === undefined || v === "" || v === "off") return "off";
+  if (v === "worker") return "worker";
+  throw new Error(`invalid --maintenance value "${v}" (expected "off" or "worker")`);
 }
 
 function parseFlags(argv: string[]): Record<string, string> {

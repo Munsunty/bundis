@@ -15,6 +15,8 @@ export interface HarnessOptions {
   dbPath?: string;
   password?: string | null;
   reaperIntervalMs?: number;
+  maintenance?: "off" | "worker";
+  maintParams?: Record<string, string>;
 }
 
 export interface Harness {
@@ -35,6 +37,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     dbPath: opts.dbPath ?? ":memory:",
     password: opts.password ?? null,
     reaperIntervalMs: opts.reaperIntervalMs ?? 50,
+    maintenance: opts.maintenance ?? "off",
+    maintParams: opts.maintParams ?? {},
   };
   const running = startServer(config);
   const auth = config.password ? `:${config.password}@` : "";
