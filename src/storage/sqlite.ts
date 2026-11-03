@@ -1206,13 +1206,40 @@ export class SqliteStorage implements StorageEngine {
   // ── statement cache ─────────────────────────────────────────────────────--
 
   #stmtCache = new Map<string, ReturnType<Database["query"]>>();
+  #writeGuard: (() => boolean) | null = null;
+
+  /**
+   * Install a predicate that forbids writes while it returns true. Worker
+   * maintenance uses it to enforce "the main connection never writes while the
+   * overlay buffers" at runtime: a write statement fetched then throws instead
+   * of blocking on the worker's write lock or silently diverging from the
+   * buffer. Every data statement goes through {@link #stmt}, so this covers all
+   * of them. Classification comes from `Statement.readonly`
+   * (sqlite3_stmt_readonly, Bun >= 1.4.4); older Bun skips the check.
+   */
+  setWriteGuard(forbidWrites: (() => boolean) | null): void {
+    this.#writeGuard = forbidWrites;
+  }
+
   #stmt(sql: string): ReturnType<Database["query"]> {
     let s = this.#stmtCache.get(sql);
     if (!s) {
       s = this.#db.query(sql);
       this.#stmtCache.set(sql, s);
     }
+    // `readonly` is undefined before Bun 1.4.4 → `=== false` skips the check.
+    if (this.#writeGuard !== null && s.readonly === false && this.#writeGuard()) {
+      throw new WriteGuardError(sql);
+    }
     return s;
+  }
+}
+
+/** A write reached SQLite while the maintenance overlay forbids it (a bug). */
+export class WriteGuardError extends Error {
+  constructor(readonly sql: string) {
+    super(`SQLite write while maintenance is buffering writes: ${sql.replace(/\s+/g, " ").trim()}`);
+    this.name = "WriteGuardError";
   }
 }
 

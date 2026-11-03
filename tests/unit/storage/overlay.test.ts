@@ -95,8 +95,12 @@ function differential(seed: number, steps: number): void {
 
   const A = new SqliteStorage(":memory:");
   let overlay!: OverlayStorage;
-  const baseB = guardBase(new SqliteStorage(":memory:"), () => overlay);
+  const rawB = new SqliteStorage(":memory:");
+  const baseB = guardBase(rawB, () => overlay);
   overlay = new OverlayStorage(baseB);
+  // The production guard too: every read the overlay issues while buffering
+  // must classify as readonly (no false positives across all types).
+  rawB.setWriteGuard(() => overlay.active && !overlay.applying);
   const B: StorageEngine = overlay;
 
   let now = 1_000_000;

@@ -142,6 +142,22 @@ describe("maintenance: IDLE buffering", () => {
     expect(await c.send("DBSIZE", [])).toBe(n + 3);
   });
 
+  test("keys written during IDLE stay in the hot cache after the buffer is applied", async () => {
+    const h = await workerServer();
+    const c = h.client;
+    await bigHash(c, "big", 300_000);
+    await c.del("big");
+    await c.send("MAINT", ["RUN"]);
+    await untilState(c, "idle", 1, 5_000);
+    await c.set("cached", "v");
+    await untilState(c, "normal");
+    const hits = async (): Promise<number> =>
+      Number(/cache_hits:(\d+)/.exec(String(await c.send("INFO", [])))?.[1]);
+    const before = await hits();
+    expect(await c.get("cached")).toBe("v");
+    expect(await hits()).toBe(before + 1); // served from cache, not re-read from SQLite
+  });
+
   test("clean stop during IDLE drains the buffer (restart keeps the writes)", async () => {
     const path = mkTempDbPath();
     const h = await workerServer({}, path);
@@ -245,7 +261,7 @@ describe("maintenance: runtime configuration", () => {
 
   test("maintenance off: MAINT and maint-* CONFIG SET are rejected", async () => {
     const path = mkTempDbPath();
-    const h = await startHarness({ dbPath: path });
+    const h = await startHarness({ dbPath: path, maintenance: "off" });
     opened.push({ h, path });
     await expect(h.client.send("MAINT", ["STATUS"])).rejects.toThrow(/maintenance is off/);
     await expect(h.client.send("CONFIG", ["SET", "maint-chunk-rows", "100"])).rejects.toThrow(/maintenance is off/);

@@ -197,6 +197,7 @@ Redis 체감과 맞추려면 **두 경로 모두** 구현:
 - **IDLE 쓰기 버퍼**: IDLE 동안 메인 스레드는 SQLite에 쓰지 않는다(`storage/overlay.ts`). 쓰기는 키 단위 버퍼(tombstone / 전체 교체 / 필드·멤버·리스트 끝 연산 delta + TTL override)에 쌓이고, 읽기는 "버퍼 우선, 없으면 SQLite"로 합친다(WAL이라 동시 읽기 가능). worker가 끝나면 버퍼를 시간 예산 단위로 SQLite에 반영한다. IDLE 중 건드리지 않은 cold 키는 SQLite에 그대로 있고, hot cache는 write-through라 되내릴 것이 없다.
 - **경계 조건**: worker는 사이클 시작 전 cutoff 이하로 만료된 키만 지운다. 이런 키는 오버레이에서도 이미 없는 키라 버퍼가 그 행에 의존하지 않는다. 다음 사이클은 버퍼가 빈 뒤에만 시작한다.
 - **런타임 조절**: 모든 파라미터는 `CONFIG SET maint-*`로 바꾸고 `CONFIG GET` / `INFO`(# Maintenance) / `MAINT STATUS`로 본다. `MAINT RUN`은 즉시 사이클을 시작한다.
+- **불변식의 런타임 강제**: "IDLE 중 메인 연결은 쓰지 않는다"를 `Statement.readonly`(sqlite3_stmt_readonly, Bun ≥ 1.4.4)로 검사한다. 오버레이가 버퍼링 중이고 반영 중이 아닐 때 쓰기 문장이 `#stmt()`를 지나면 `WriteGuardError`를 던진다(조용한 정합성 손상 대신 명시적 `ERR`). 1.4.4 미만에서는 검사를 건너뛴다. 모든 데이터 SQL은 `#stmt()`를 지나야 한다.
 - **계약 변경점**: (1) 단일 writer는 `EXCLUSIVE` 잠금 대신 `<db>.lock` 파일(pid)로 강제한다. (2) **IDLE 중 버퍼된 쓰기는 반영 전까지 메모리에만 있다.** 정상 종료는 반영 후 닫지만, 비정상 종료 시 유실된다(수용한 트레이드오프).
 
 ---
@@ -272,6 +273,7 @@ Redis 체감과 맞추려면 **두 경로 모두** 구현:
 - **만료 테스트**: `EXPIRE` 후 lazy/active 양 경로에서 미존재 확인.
 - **재시작 영속성 테스트**: set → 서버 재시작 → get 생존 확인.
 - **차분 테스트(선택)**: 동일 명령 시퀀스를 진짜 Redis와 이 서버에 각각 던져 클라이언트 반환값 비교.
+- **worker 모드 반복 실행**: `bun run test:worker`는 계약 테스트 전체를 worker 유지보수 모드로 다시 돌린다. 정리 사이클을 쉬지 않고 돌려서 명령이 IDLE·FLUSHING·NORMAL 상태에 고루 걸치게 하고, 런타임 쓰기 검사가 그 전체를 감시한다. 저장 계층이나 명령을 바꾸면 두 모드 모두 통과해야 한다.
 
 ---
 

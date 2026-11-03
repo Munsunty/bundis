@@ -70,13 +70,18 @@ export function startServer(config: ServerConfig): RunningServer {
   try {
     sqlite = new SqliteStorage(config.dbPath, {
       onWrite: (key) => {
-        // Applying the IDLE buffer re-writes keys whose WATCH versions were
-        // already bumped when the buffered write happened: no double bump.
-        if (!overlay?.applying) watch.bump(key);
+        // Applying the IDLE buffer only converges SQLite to the merged view
+        // that WATCH versions and the hot cache already reflect (both were
+        // updated when the buffered write happened). Re-bumping would abort
+        // innocent EXECs; re-invalidating would evict every key written
+        // during maintenance from the write-through cache.
+        if (overlay?.applying) return;
+        watch.bump(key);
         cache?.invalidate(key); // every mutation evicts its stale cache entry
       },
       onFlushAll: () => {
-        if (!overlay?.applying) watch.bumpAll();
+        if (overlay?.applying) return;
+        watch.bumpAll();
         cache?.invalidateAll();
       },
       // 50% of the overall memory budget goes to the SQLite page cache.
@@ -103,6 +108,10 @@ export function startServer(config: ServerConfig): RunningServer {
         { mainThreadSweep: false },
       );
       maintenance = new Maintenance(sqlite, overlay, config.maintParams ?? {});
+      // Runtime enforcement of the IDLE invariant: while the overlay buffers
+      // (and is not applying its buffer), no write statement may reach SQLite.
+      const ov = overlay;
+      sqlite.setWriteGuard(() => ov.active && !ov.applying);
     }
   } catch (err) {
     releaseLock?.();

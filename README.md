@@ -296,9 +296,16 @@ By design (see [`CLAUDE.md`](./CLAUDE.md), the design SSOT):
 ## Testing
 
 ```bash
-bun test          # unit (no network) + contract (real TCP, stock client)
-bun run typecheck # tsc --noEmit, strict
+bun test            # unit (no network) + contract (real TCP, stock client)
+bun run test:worker # contract suite again, in worker maintenance mode under churn
+bun run typecheck   # tsc --noEmit, strict
 ```
+
+`test:worker` gives every contract-test server a file database and keeps
+maintenance cycles running back to back, so commands land while writes are
+buffered, applied or written straight through. A runtime write guard
+(`Statement.readonly`, Bun ≥ 1.4.4) makes any SQLite write on the main
+connection during buffering fail loudly instead of stalling or diverging.
 
 Contract tests boot the server on an ephemeral port and drive it with a genuine
 `Bun.RedisClient`, asserting on the **JS values it returns** — the only honest
